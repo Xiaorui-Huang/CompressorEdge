@@ -1,8 +1,12 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.aboutlibraries.android)
 }
+
+// Kotlin compilation is provided by AGP's built-in Kotlin support (default since AGP 9.0);
+// the separate org.jetbrains.kotlin.android plugin is no longer applied. The Compose
+// compiler plugin is still required until AGP bundles it.
 
 android {
     namespace = "compressedge.joshattic.us"
@@ -33,9 +37,8 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
-    }
+    // Built-in Kotlin derives the Kotlin jvmTarget from compileOptions, so the
+    // deprecated kotlinOptions block is no longer needed.
     buildFeatures {
         compose = true
         buildConfig = true
@@ -49,6 +52,7 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.documentfile)
+    implementation(libs.aboutlibraries.core)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.activity.compose)
@@ -67,7 +71,7 @@ dependencies {
     implementation(libs.androidx.ui)
     testImplementation(libs.junit)
     testImplementation("org.mockito:mockito-core:5.5.0")
-    testImplementation("org.mockito.kotlin:mockito-kotlin:5.1.0")
+    testImplementation("org.mockito.kotlin:mockito-kotlin:6.3.0")
     testImplementation("org.robolectric:robolectric:4.11.1")
     testImplementation("androidx.test:core:1.5.0")
     androidTestImplementation(libs.androidx.junit)

@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import androidx.annotation.OptIn
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -11,7 +13,6 @@ import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.Clock
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.AudioEncoderSettings
 import androidx.media3.transformer.Codec
@@ -108,6 +109,26 @@ object CompressionExecutor {
         val primaryEncoderFactory = if (isMediaTek) vbrEncoderFactory else cbrEncoderFactory
         val fallbackEncoderFactory = if (isMediaTek) cbrEncoderFactory else vbrEncoderFactory
 
+        val audioMimeType = when (params.audioCodec) {
+            MimeTypes.AUDIO_OPUS -> MimeTypes.AUDIO_OPUS
+            else -> MimeTypes.AUDIO_AAC
+        }
+
+        // Avoid re-encoding audio (which can introduce quality loss and takes extra time)
+        // when the source track already matches what we'd produce: same codec (AAC-LC),
+        // same bitrate, no volume change, and audio isn't being removed.
+        val audioProbe = probeAudioTrack(context, params.inputUri)
+        val audioPassthrough = audioProbe.hasAudio &&
+            !params.removeAudio &&
+            audioMimeType == MimeTypes.AUDIO_AAC &&
+            audioProbe.mime == MimeTypes.AUDIO_AAC &&
+            (audioProbe.aacProfile == -1 || audioProbe.aacProfile == android.media.MediaCodecInfo.CodecProfileLevel.AACObjectLC) &&
+            params.audioVolume == 1f &&
+            audioProbe.bitrate > 0 &&
+            params.audioBitrate == audioProbe.bitrate
+
+        val shouldIncludeAudio = !params.removeAudio && audioProbe.hasAudio
+
         val encoderFactory = object : Codec.EncoderFactory {
             override fun createForAudioEncoding(
                 format: androidx.media3.common.Format,
@@ -137,25 +158,24 @@ object CompressionExecutor {
                 }
             }
 
-            override fun audioNeedsEncoding(): Boolean = primaryEncoderFactory.audioNeedsEncoding()
+            override fun audioNeedsEncoding(): Boolean =
+                !audioPassthrough && primaryEncoderFactory.audioNeedsEncoding()
             override fun videoNeedsEncoding(): Boolean = primaryEncoderFactory.videoNeedsEncoding()
-        }
-
-        val audioMimeType = when (params.audioCodec) {
-            MimeTypes.AUDIO_OPUS -> MimeTypes.AUDIO_OPUS
-            else -> MimeTypes.AUDIO_AAC
         }
 
         val transformerBuilder = Transformer.Builder(context)
             .setLooper(Looper.getMainLooper())
             .setVideoMimeType(videoMimeType)
-            .setAudioMimeType(audioMimeType)
+            .setMaxDelayBetweenMuxerSamplesMs(30_000)
             .apply {
+                if (!audioPassthrough) {
+                    setAudioMimeType(audioMimeType)
+                }
                 if (audioMimeType == MimeTypes.AUDIO_OPUS) {
                     setMuxerFactory(DefaultMuxer.Factory())
                 }
             }
-            .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, Clock.DEFAULT, android.media.metrics.LogSessionId.LOG_SESSION_ID_NONE))
+            .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, Clock.DEFAULT, null))
             .setEncoderFactory(encoderFactory)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
@@ -189,21 +209,21 @@ object CompressionExecutor {
             }
         }
 
-        if (params.outputFps > 0 && params.outputFps.toFloat() < params.originalFps) {
-            effectsList.add(FrameDropEffect.createSimpleFrameDropEffect(params.originalFps, params.outputFps.toFloat()))
-        }
-
         val mediaItem = MediaItem.fromUri(params.inputUri)
-        val audioProcessors: List<AudioProcessor> = if (!params.removeAudio) {
+
+        val audioProcessors: List<AudioProcessor> = if (shouldIncludeAudio && !audioPassthrough) {
             val volumeProcessor = VolumeAudioProcessor().apply { setVolume(params.audioVolume) }
             listOf(volumeProcessor, SonicAudioProcessor())
         } else {
             emptyList()
         }
-        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+        val editedMediaItemBuilder = EditedMediaItem.Builder(mediaItem)
             .setEffects(Effects(audioProcessors, effectsList))
-            .setRemoveAudio(params.removeAudio)
-            .build()
+            .setRemoveAudio(!shouldIncludeAudio)
+        if (params.outputFps > 0) {
+            editedMediaItemBuilder.setFrameRate(params.outputFps.toFloat())
+        }
+        val editedMediaItem = editedMediaItemBuilder.build()
 
         var hdrMode = Composition.HDR_MODE_KEEP_HDR
         if (Build.MANUFACTURER.equals("Google", ignoreCase = true) && Build.MODEL.contains("Pixel 10")) {
@@ -215,14 +235,48 @@ object CompressionExecutor {
             }
         }
 
+        val sequence = if (shouldIncludeAudio) {
+            EditedMediaItemSequence.withAudioAndVideoFrom(listOf(editedMediaItem))
+        } else {
+            EditedMediaItemSequence.withVideoFrom(listOf(editedMediaItem))
+        }
+
         val composition = Composition.Builder(
-            listOf(EditedMediaItemSequence.withAudioAndVideoFrom(listOf(editedMediaItem)))
+            listOf(sequence)
         )
             .setHdrMode(hdrMode)
             .build()
 
         transformer.start(composition, params.outputPath)
         return transformer
+    }
+
+    private data class AudioProbe(
+        val hasAudio: Boolean,
+        val mime: String?,
+        val bitrate: Int,
+        val aacProfile: Int
+    )
+
+    private fun probeAudioTrack(context: Context, uri: Uri): AudioProbe {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(context, uri, null)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME)
+                if (mime?.startsWith("audio/") == true) {
+                    val bitrate = if (format.containsKey(MediaFormat.KEY_BIT_RATE)) format.getInteger(MediaFormat.KEY_BIT_RATE) else 0
+                    val aacProfile = if (format.containsKey("aac-profile")) format.getInteger("aac-profile") else -1
+                    return AudioProbe(hasAudio = true, mime = mime, bitrate = bitrate, aacProfile = aacProfile)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            extractor.release()
+        }
+        return AudioProbe(hasAudio = false, mime = null, bitrate = 0, aacProfile = -1)
     }
 
     suspend fun executeSuspend(

@@ -22,6 +22,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Share
@@ -71,7 +72,9 @@ fun AboutScreen(
     onBack: () -> Unit,
     onEnableAllCodecs: () -> Unit,
     onDisableAllCodecs: () -> Unit,
-    isSoftwareCodec: (String) -> Boolean
+    isSoftwareCodec: (String) -> Boolean,
+    onOpenLicenses: () -> Unit,
+    onShowWhatsNew: () -> Unit
 ) {
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val context = LocalContext.current
@@ -243,7 +246,7 @@ fun AboutScreen(
                 Column {
                     InfoDetailRow(title = stringResource(R.string.info_app_name), value = stringResource(R.string.app_name))
                     HorizontalDivider(modifier = Modifier.padding(horizontal = 20.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
-                    InfoDetailRow(title = stringResource(R.string.info_app_version), value = state.appInfoVersion)
+                    InfoDetailRow(title = stringResource(R.string.info_app_version), value = state.appInfoVersion, onClick = onShowWhatsNew)
                     HorizontalDivider(modifier = Modifier.padding(horizontal = 20.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
                     InfoDetailRow(title = stringResource(R.string.info_device), value = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
                     HorizontalDivider(modifier = Modifier.padding(horizontal = 20.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
@@ -494,6 +497,30 @@ fun AboutScreen(
                             modifier = Modifier.weight(1f)
                         )
                     }
+
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 20.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenLicenses() }
+                            .padding(horizontal = 20.dp, vertical = 18.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Code,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Text(
+                            text = stringResource(R.string.open_source_licenses),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
             }
         }
@@ -501,9 +528,12 @@ fun AboutScreen(
 }
 
 @Composable
-private fun InfoDetailRow(title: String, value: String) {
+private fun InfoDetailRow(title: String, value: String, onClick: (() -> Unit)? = null) {
+    // Nullable onClick keeps non-interactive rows unclickable while letting the
+    // version row double as a way to re-open the What's New dialog.
+    val rowModifier = if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
     Column(
-        modifier = Modifier
+        modifier = rowModifier
             .fillMaxWidth()
             .padding(horizontal = 20.dp, vertical = 16.dp)
     ) {
