@@ -41,6 +41,8 @@ data class CompressorUiState(
     val progress: Float = 0f,
     val compressedUri: Uri? = null,
     val compressedUris: List<Uri> = emptyList(),
+    /** Parallel to [compressedUris] (and [compressedUri] when not batching): the source uri each compressed file was produced from. */
+    val compressedOriginalUris: List<Uri> = emptyList(),
     val compressedSize: Long = 0L,
     val currentOutputSize: Long = 0L,
     val error: String? = null,
@@ -81,6 +83,8 @@ data class CompressorUiState(
     val backgroundCompressionPrompted: Boolean = false,
     val customOutputTreeUri: String? = null,
     val customOutputFolderName: String? = null,
+    /** When enabled, saving tries to place the output next to its original source file before falling back to the configured location above. */
+    val saveNextToOriginal: Boolean = false,
     val hasShared: Boolean = false,
     val removeAudio: Boolean = false,
     val audioCodec: String = MimeTypes.AUDIO_AAC,
