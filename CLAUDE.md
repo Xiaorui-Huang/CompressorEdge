@@ -133,6 +133,28 @@ static checks (grep for conflict markers, brace/paren balance, XML
 well-formedness, cross-referencing `R.string.x` usages against
 `values/strings.xml`) are the fallback verification method.
 
+**Better alternative — use CI instead of a local build for verification**:
+GitHub Actions runners have full internet access (no `dl.google.com` block),
+so a real build there is a far stronger signal than the static checks above.
+This fork already inherited two Actions workflows from upstream:
+- `.github/workflows/pr-build.yml` — builds `assembleDebug` and uploads the
+  APK as an artifact whenever a PR targets `main` (this is the "upstream
+  contribution" path — keep using it as-is for any PR opened against
+  upstream or this fork's own `main`). It also accepts `workflow_dispatch`
+  (with a `pr_number` input) so the `/rebuild` PR-comment command
+  (`pr-commands.yml`) can re-trigger it.
+- `.github/workflows/push-build.yml` (added in this session) — the personal/
+  testing counterpart: builds `assembleDebug` on every push to any branch
+  *other than* `main` (e.g. this fork's own working branches), no PR
+  required. Purely for quick manual on-device testing — not a release
+  workflow (no signing/publishing). Uploads the APK (or the build log on
+  failure) as a build artifact.
+
+Trigger either by pushing, or manually via the Actions tab / `gh workflow run`
+(needs a token with `actions:write`, not available in this sandbox's git
+proxy). Neither workflow signs or publishes anything, so they're safe to run
+freely and won't interfere with however actual signed releases get cut.
+
 ## Git identity / attribution note
 
 Commits to this repo should use the human owner's name/email
