@@ -99,6 +99,7 @@
     <string name="error_export_failed">Export failed: %1$s</string>
     <string name="error_save_failed">Save failed: %1$s</string>
     <string name="error_gallery_entry">Could not create gallery entry</string>
+    <string name="error_undo_failed">Could not undo - the backup is no longer available or the restore failed.</string>
     <string name="error_unknown">Unknown error</string>
     <string name="error_codec_unsupported">This video codec is not supported by your device hardware.</string>
     <string name="error_decoder_config_unsupported">This device can\'t decode this source video configuration.</string>

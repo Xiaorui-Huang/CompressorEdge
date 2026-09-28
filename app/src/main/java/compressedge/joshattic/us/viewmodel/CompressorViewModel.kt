@@ -1518,6 +1518,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 if (stillPending.isNotEmpty()) {
                     updateReplaceRollback(stillPending)
+                    // Otherwise the button just reappears with isSaving flipping briefly and no
+                    // explanation of why the restore didn't happen (missing backup or a failed insert).
+                    _uiState.update {
+                        it.copy(error = getApplication<Application>().getString(R.string.error_undo_failed))
+                    }
                 }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
@@ -1794,6 +1799,17 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             }
         } catch (e: Exception) {
             e.printStackTrace()
+        }
+        // A file just purged above may be the backup behind the *currently pending* undo entry
+        // (e.g. it's older than 3 days but the user never tapped Undo) - prune it from state too,
+        // not just from disk. Otherwise the Undo button keeps showing for an entry that can never
+        // succeed, since nothing else evicts pendingReplaceRollback between app launches.
+        val current = _uiState.value.pendingReplaceRollback
+        if (current.isNotEmpty()) {
+            val stillValid = current.filter { File(it.rollbackFilePath).exists() }
+            if (stillValid.size != current.size) {
+                updateReplaceRollback(stillValid)
+            }
         }
     }
 
@@ -2094,6 +2110,14 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun reset() {
+        // A save/replace coroutine launched on viewModelScope (saveCompressedOutput/replaceOriginals/
+        // undoReplaceOriginal/saveToUri/saveToCustomTree/saveToGallery) does blocking file I/O with no
+        // suspension points, so cancelling it wouldn't actually stop it before it finishes and writes
+        // its result (saveSuccess/error/pendingReplaceRollback) back to _uiState - which would land on
+        // whatever fresh session reset() below just started, corrupting it (e.g. marking an unrelated
+        // new compression as already "Saved"). Declining to reset while isSaving is true, matching the
+        // same guard saveCompressedOutput/undoReplaceOriginal already use, avoids the race entirely.
+        if (_uiState.value.isSaving) return
         val current = _uiState.value
         val savedBytes = current.totalSavedBytes
         val supportedCodecs = current.supportedCodecs
@@ -2344,10 +2368,6 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                         }
                         addMetadataPreservationWarnings(warningsAcc, metadataResult)
                     }
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && _uiState.value.autoSaveToPhotos) {
-                        saveCompressedOutput(getApplication())
-                    }
                 } catch (e: Exception) {
                     if (e is androidx.media3.transformer.ExportException) {
                         val errorMsg = CompressionExecutor.errorMessage(getApplication<android.app.Application>(), e)
@@ -2389,6 +2409,14 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                         compressedSize = totalOutputSize,
                         totalSavedBytes = newTotal
                     )
+                }
+                // Fires only after compressedUri/compressedUris/compressedOriginalUris above are set -
+                // saveCompressedOutput() reads that state to know what to save, so calling it any
+                // earlier (e.g. per-item, mid-loop) would act on the previous run's stale/empty state
+                // instead of what this run just produced. Matches startBackgroundCompression's
+                // collector, which updates the same fields before its own auto-save call.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && _uiState.value.autoSaveToPhotos) {
+                    saveCompressedOutput(getApplication())
                 }
             }
         }
@@ -2928,6 +2956,14 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 if (savedCount > 0) {
                     addPartialSaveWarning(savedCount, targetUris.size)
                     _uiState.update { it.copy(saveSuccess = true) }
+                } else if (_uiState.value.error == null) {
+                    // saveUrisToCustomTreeBlocking already sets a specific error for "folder not
+                    // writable"; this covers the other savedCount == 0 case - every individual file
+                    // write failed even though the tree itself was writable - which otherwise left
+                    // isSaving/saveSuccess/error all falling back to their defaults with no feedback.
+                    _uiState.update {
+                        it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, "No files could be written"))
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
