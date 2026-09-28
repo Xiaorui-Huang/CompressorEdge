@@ -248,6 +248,7 @@ fun ResultScreen(
 
         if (state.pendingReplaceRollback.isNotEmpty()) {
             TextButton(
+                enabled = !state.isSaving,
                 onClick = {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     onUndoReplace()
