@@ -1773,7 +1773,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                             warningsAcc.add(warningMsg)
                             _uiState.update { it.copy(warnings = warningsAcc.toList()) }
                         }
-                    }
+                    },
+                    onMetadataResult = { result -> addMetadataPreservationWarnings(warningsAcc, result) }
                 )
 
                 try {
@@ -1971,6 +1972,14 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     onHdrToneMap = {
                         val warningMsg = getApplication<android.app.Application>().getString(R.string.warning_hdr_tone_mapped)
                         BackgroundCompressionManager.setHdrWarning(warningMsg)
+                    },
+                    onMetadataResult = { result ->
+                        val app = getApplication<Application>()
+                        if (result.timestampPreserved == false) {
+                            BackgroundCompressionManager.setMetadataWarning(app.getString(R.string.warning_metadata_date_not_preserved))
+                        } else if (result.locationPreserved == false) {
+                            BackgroundCompressionManager.setMetadataWarning(app.getString(R.string.warning_metadata_location_not_preserved))
+                        }
                     }
                 )
             )
@@ -2028,7 +2037,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                                 compressedOriginalUris = itemsToProcess.take(bg.compressedUris.size).map { item -> item.uri },
                                 compressedSize = bg.compressedSize,
                                 totalSavedBytes = newTotal,
-                                warnings = bg.hdrWarning?.let { w -> listOf(w) } ?: it.warnings
+                                warnings = listOfNotNull(bg.hdrWarning, bg.metadataWarning).ifEmpty { null } ?: it.warnings
                             )
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && _uiState.value.autoSaveToPhotos) {
@@ -2059,6 +2068,32 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
             }
+        }
+    }
+
+    /** Appends a warning for each source metadata field that couldn't be carried into the output. */
+    private fun addMetadataPreservationWarnings(
+        warningsAcc: MutableList<String>,
+        result: CompressionExecutor.MetadataPreservationResult
+    ) {
+        val app = getApplication<Application>()
+        var changed = false
+        if (result.timestampPreserved == false) {
+            val msg = app.getString(R.string.warning_metadata_date_not_preserved)
+            if (!warningsAcc.contains(msg)) {
+                warningsAcc.add(msg)
+                changed = true
+            }
+        }
+        if (result.locationPreserved == false) {
+            val msg = app.getString(R.string.warning_metadata_location_not_preserved)
+            if (!warningsAcc.contains(msg)) {
+                warningsAcc.add(msg)
+                changed = true
+            }
+        }
+        if (changed) {
+            _uiState.update { it.copy(warnings = warningsAcc.toList()) }
         }
     }
 

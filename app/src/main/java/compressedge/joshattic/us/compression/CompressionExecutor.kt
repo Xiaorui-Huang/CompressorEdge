@@ -1,6 +1,7 @@
 package compressedge.joshattic.us.compression
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import androidx.annotation.OptIn
@@ -13,6 +14,8 @@ import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.Clock
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.container.Mp4LocationData
+import androidx.media3.container.Mp4TimestampData
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.AudioEncoderSettings
 import androidx.media3.transformer.Codec
@@ -25,7 +28,7 @@ import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.DefaultMuxer
+import androidx.media3.transformer.InAppMp4Muxer
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import compressedge.joshattic.us.R
@@ -60,8 +63,105 @@ object CompressionExecutor {
         val audioCodec: String,
         val removeAudio: Boolean,
         val audioVolume: Float,
-        val onHdrToneMap: (() -> Unit)? = null
+        val onHdrToneMap: (() -> Unit)? = null,
+        val onMetadataResult: ((MetadataPreservationResult) -> Unit)? = null
     )
+
+    /**
+     * Per-field result of trying to carry the source video's creation/modification date and GPS
+     * location into the compressed output. `null` means the field wasn't present on the source
+     * (nothing to preserve, not a failure); `true`/`false` reflect whether re-reading the finished
+     * output confirmed it actually landed there.
+     */
+    data class MetadataPreservationResult(
+        val timestampPreserved: Boolean?,
+        val locationPreserved: Boolean?
+    )
+
+    /** Seconds between the MP4/QuickTime epoch (1904-01-01 UTC) and the Unix epoch (1970-01-01 UTC). */
+    private const val MP4_EPOCH_OFFSET_SECONDS = 2_082_844_800L
+
+    /**
+     * Reads the source's creation date and GPS location (if present) via [MediaMetadataRetriever],
+     * which works for any content/file uri regardless of whether it's MediaStore-backed. Returns
+     * `null` per field when it's missing or unparseable — the compression still proceeds, just
+     * without preserving that field.
+     */
+    private fun readSourceMp4Metadata(context: Context, uri: Uri): Pair<Mp4TimestampData?, Mp4LocationData?> {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            val timestamp = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE)
+                ?.let { parseMp4Date(it) }
+                ?.let { unixSeconds -> Mp4TimestampData(unixSeconds + MP4_EPOCH_OFFSET_SECONDS, unixSeconds + MP4_EPOCH_OFFSET_SECONDS) }
+            val location = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)
+                ?.let { parseIso6709Location(it) }
+                ?.let { (lat, lon) -> Mp4LocationData(lat, lon) }
+            Pair(timestamp, location)
+        } catch (e: Exception) {
+            Pair(null, null)
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {}
+        }
+    }
+
+    /** Parses MediaMetadataRetriever's METADATA_KEY_DATE format ("yyyyMMdd'T'HHmmss.SSS'Z'") into Unix epoch seconds. */
+    private fun parseMp4Date(raw: String): Long? {
+        return try {
+            val format = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss.SSS'Z'", java.util.Locale.US)
+            format.timeZone = java.util.TimeZone.getTimeZone("UTC")
+            format.parse(raw)?.time?.let { it / 1000L }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Parses an ISO 6709 location string (e.g. "+37.4219-122.0840/") into (latitude, longitude). */
+    private fun parseIso6709Location(raw: String): Pair<Float, Float>? {
+        return try {
+            val match = Regex("^([+-][0-9.]+)([+-][0-9.]+)").find(raw.trim()) ?: return null
+            val lat = match.groupValues[1].toFloatOrNull() ?: return null
+            val lon = match.groupValues[2].toFloatOrNull() ?: return null
+            Pair(lat, lon)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Re-reads the just-written output file and checks whether the metadata we tried to inject actually landed there. */
+    private fun verifyOutputMp4Metadata(
+        outputPath: String,
+        expectedTimestamp: Mp4TimestampData?,
+        expectedLocation: Mp4LocationData?
+    ): MetadataPreservationResult {
+        if (expectedTimestamp == null && expectedLocation == null) {
+            return MetadataPreservationResult(timestampPreserved = null, locationPreserved = null)
+        }
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(outputPath)
+            val timestampPreserved = expectedTimestamp?.let {
+                val actual = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE)?.let { d -> parseMp4Date(d) }
+                actual != null && actual + MP4_EPOCH_OFFSET_SECONDS == it.creationTimestampSeconds
+            }
+            val locationPreserved = expectedLocation?.let {
+                val actual = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)?.let { l -> parseIso6709Location(l) }
+                actual != null && kotlin.math.abs(actual.first - it.latitude) < 0.001f && kotlin.math.abs(actual.second - it.longitude) < 0.001f
+            }
+            MetadataPreservationResult(timestampPreserved, locationPreserved)
+        } catch (e: Exception) {
+            MetadataPreservationResult(
+                timestampPreserved = expectedTimestamp?.let { false },
+                locationPreserved = expectedLocation?.let { false }
+            )
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {}
+        }
+    }
 
     fun execute(
         context: Context,
@@ -129,6 +229,8 @@ object CompressionExecutor {
 
         val shouldIncludeAudio = !params.removeAudio && audioProbe.hasAudio
 
+        val (sourceTimestamp, sourceLocation) = readSourceMp4Metadata(context, params.inputUri)
+
         val encoderFactory = object : Codec.EncoderFactory {
             override fun createForAudioEncoding(
                 format: androidx.media3.common.Format,
@@ -171,14 +273,20 @@ object CompressionExecutor {
                 if (!audioPassthrough) {
                     setAudioMimeType(audioMimeType)
                 }
-                if (audioMimeType == MimeTypes.AUDIO_OPUS) {
-                    setMuxerFactory(DefaultMuxer.Factory())
-                }
             }
+            .setMuxerFactory(
+                InAppMp4Muxer.Factory { metadataEntries ->
+                    sourceTimestamp?.let { metadataEntries.add(it) }
+                    sourceLocation?.let { metadataEntries.add(it) }
+                }
+            )
             .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, Clock.DEFAULT, null))
             .setEncoderFactory(encoderFactory)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                    params.onMetadataResult?.invoke(
+                        verifyOutputMp4Metadata(params.outputPath, sourceTimestamp, sourceLocation)
+                    )
                     onCompleted(File(params.outputPath).length())
                 }
 
