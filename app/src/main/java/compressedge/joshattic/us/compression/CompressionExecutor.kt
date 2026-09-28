@@ -64,7 +64,13 @@ object CompressionExecutor {
         val removeAudio: Boolean,
         val audioVolume: Float,
         val onHdrToneMap: (() -> Unit)? = null,
-        val onMetadataResult: ((MetadataPreservationResult) -> Unit)? = null
+        /**
+         * Pre-read via [readSourceMp4Metadata] on a background dispatcher by the caller — `execute()`
+         * runs on the main looper, so it never does this I/O itself. `null` means "not present on the
+         * source" (or the caller didn't bother reading it), not "read failed".
+         */
+        val sourceTimestamp: Mp4TimestampData? = null,
+        val sourceLocation: Mp4LocationData? = null
     )
 
     /**
@@ -87,7 +93,7 @@ object CompressionExecutor {
      * `null` per field when it's missing or unparseable — the compression still proceeds, just
      * without preserving that field.
      */
-    private fun readSourceMp4Metadata(context: Context, uri: Uri): Pair<Mp4TimestampData?, Mp4LocationData?> {
+    internal fun readSourceMp4Metadata(context: Context, uri: Uri): Pair<Mp4TimestampData?, Mp4LocationData?> {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)
@@ -112,6 +118,7 @@ object CompressionExecutor {
         return try {
             val format = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss.SSS'Z'", java.util.Locale.US)
             format.timeZone = java.util.TimeZone.getTimeZone("UTC")
+            format.isLenient = false
             format.parse(raw)?.time?.let { it / 1000L }
         } catch (e: Exception) {
             null
@@ -161,6 +168,17 @@ object CompressionExecutor {
                 retriever.release()
             } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Checks metadata preservation for a finished output against its source. Does blocking I/O
+     * (MediaMetadataRetriever) — call this from a background dispatcher, never from the main thread.
+     * Used both right after a compression completes and again at save time (e.g. before a
+     * destructive "replace original").
+     */
+    fun checkMetadataPreservation(context: Context, sourceUri: Uri, outputPath: String): MetadataPreservationResult {
+        val (timestamp, location) = readSourceMp4Metadata(context, sourceUri)
+        return verifyOutputMp4Metadata(outputPath, timestamp, location)
     }
 
     fun execute(
@@ -229,7 +247,8 @@ object CompressionExecutor {
 
         val shouldIncludeAudio = !params.removeAudio && audioProbe.hasAudio
 
-        val (sourceTimestamp, sourceLocation) = readSourceMp4Metadata(context, params.inputUri)
+        val sourceTimestamp = params.sourceTimestamp
+        val sourceLocation = params.sourceLocation
 
         val encoderFactory = object : Codec.EncoderFactory {
             override fun createForAudioEncoding(
@@ -284,9 +303,10 @@ object CompressionExecutor {
             .setEncoderFactory(encoderFactory)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    params.onMetadataResult?.invoke(
-                        verifyOutputMp4Metadata(params.outputPath, sourceTimestamp, sourceLocation)
-                    )
+                    // Metadata verification does blocking I/O (MediaMetadataRetriever) and this
+                    // callback fires on the main looper — callers check it themselves afterward
+                    // (e.g. via checkMetadataPreservation on a background dispatcher) rather than
+                    // it happening here.
                     onCompleted(File(params.outputPath).length())
                 }
 

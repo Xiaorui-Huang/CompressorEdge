@@ -441,6 +441,18 @@ class BackgroundCompressionService : Service() {
                     val uri = Uri.fromFile(File(params.outputPath))
                     lastUri = uri
                     completedUris.add(uri)
+
+                    if (params.sourceTimestamp != null || params.sourceLocation != null) {
+                        val metadataResult = CompressionExecutor.checkMetadataPreservation(
+                            applicationContext, params.inputUri, params.outputPath
+                        )
+                        if (metadataResult.timestampPreserved == false) {
+                            BackgroundCompressionManager.addMetadataWarning(getString(R.string.warning_metadata_date_not_preserved))
+                        }
+                        if (metadataResult.locationPreserved == false) {
+                            BackgroundCompressionManager.addMetadataWarning(getString(R.string.warning_metadata_location_not_preserved))
+                        }
+                    }
                 } catch (e: Exception) {
                     val errorMsg = if (e is androidx.media3.transformer.ExportException) {
                         CompressionExecutor.errorMessage(applicationContext, e)

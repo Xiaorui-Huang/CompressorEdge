@@ -1681,7 +1681,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     anyErrors = true
                     break
                 }
-                
+
+                val (itemSourceTimestamp, itemSourceLocation) = withContext(Dispatchers.IO) {
+                    CompressionExecutor.readSourceMp4Metadata(context, item.uri)
+                }
+
                 warningsAcc.addAll(plan.warnings)
                 _uiState.update { it.copy(warnings = warningsAcc.distinct()) }
 
@@ -1774,7 +1778,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                             _uiState.update { it.copy(warnings = warningsAcc.toList()) }
                         }
                     },
-                    onMetadataResult = { result -> addMetadataPreservationWarnings(warningsAcc, result) }
+                    sourceTimestamp = itemSourceTimestamp,
+                    sourceLocation = itemSourceLocation
                 )
 
                 try {
@@ -1783,13 +1788,20 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                         val currentSize = if (outputFile.exists()) outputFile.length() else 0L
                         _uiState.update { it.copy(progress = overallProgress, currentOutputSize = currentSize) }
                     }
-                    
+
                     val savedBytes = item.originalSize - finalSize
                     if (savedBytes > 0) totalSavedThisSession += savedBytes
                     val outputUri = Uri.fromFile(outputFile)
                     lastUri = outputUri
                     completedUris.add(outputUri)
-                    
+
+                    if (itemSourceTimestamp != null || itemSourceLocation != null) {
+                        val metadataResult = withContext(Dispatchers.IO) {
+                            CompressionExecutor.checkMetadataPreservation(context, item.uri, outputFile.absolutePath)
+                        }
+                        addMetadataPreservationWarnings(warningsAcc, metadataResult)
+                    }
+
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && _uiState.value.autoSaveToPhotos) {
                         saveCompressedOutput(getApplication())
                     }
@@ -1884,6 +1896,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 return@launch
             }
 
+            val (itemSourceTimestamp, itemSourceLocation) = withContext(Dispatchers.IO) {
+                CompressionExecutor.readSourceMp4Metadata(context, item.uri)
+            }
+
             warningsAcc.addAll(plan.warnings)
 
             val baseName = item.originalName?.substringBeforeLast(".") ?: "Compressed_${System.currentTimeMillis()}_$index"
@@ -1973,14 +1989,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                         val warningMsg = getApplication<android.app.Application>().getString(R.string.warning_hdr_tone_mapped)
                         BackgroundCompressionManager.setHdrWarning(warningMsg)
                     },
-                    onMetadataResult = { result ->
-                        val app = getApplication<Application>()
-                        if (result.timestampPreserved == false) {
-                            BackgroundCompressionManager.setMetadataWarning(app.getString(R.string.warning_metadata_date_not_preserved))
-                        } else if (result.locationPreserved == false) {
-                            BackgroundCompressionManager.setMetadataWarning(app.getString(R.string.warning_metadata_location_not_preserved))
-                        }
-                    }
+                    sourceTimestamp = itemSourceTimestamp,
+                    sourceLocation = itemSourceLocation
                 )
             )
         }
@@ -2037,7 +2047,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                                 compressedOriginalUris = itemsToProcess.take(bg.compressedUris.size).map { item -> item.uri },
                                 compressedSize = bg.compressedSize,
                                 totalSavedBytes = newTotal,
-                                warnings = listOfNotNull(bg.hdrWarning, bg.metadataWarning).ifEmpty { null } ?: it.warnings
+                                warnings = (listOfNotNull(bg.hdrWarning) + bg.metadataWarnings).ifEmpty { null } ?: it.warnings
                             )
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && _uiState.value.autoSaveToPhotos) {
