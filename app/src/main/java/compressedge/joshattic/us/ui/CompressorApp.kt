@@ -168,6 +168,21 @@ fun CompressorApp(viewModel: CompressorViewModel) {
         }
     }
 
+    // "Replace original" needs the user's one-time consent to delete a file this app didn't
+    // create (RecoverableSecurityException on API 29, MediaStore.createDeleteRequest on 30+).
+    val deleteConsentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.onDeleteRequestResult(result.resultCode == android.app.Activity.RESULT_OK)
+    }
+    LaunchedEffect(state.pendingDeleteRequest) {
+        state.pendingDeleteRequest?.let { intentSender ->
+            deleteConsentLauncher.launch(
+                androidx.activity.result.IntentSenderRequest.Builder(intentSender).build()
+            )
+        }
+    }
+
     var showBackgroundCompressionDialog by remember { mutableStateOf(false) }
     val notificationPermissionDeniedMessage = stringResource(R.string.notification_bg_permission_denied)
 
@@ -330,6 +345,7 @@ fun CompressorApp(viewModel: CompressorViewModel) {
                                 },
                                 onResetOutputLocation = { viewModel.clearCustomOutputFolder(context) },
                                 onToggleSaveNextToOriginal = { viewModel.setSaveNextToOriginal(!state.saveNextToOriginal) },
+                                onToggleReplaceOriginal = { viewModel.setReplaceOriginal(!state.replaceOriginal) },
                                 onToggleShowBitrate = { viewModel.toggleShowBitrate() },
                                 onToggleBitrateUnit = { viewModel.toggleBitrateUnit() },
                                 onToggleShowStorageSaved = { viewModel.toggleShowStorageSaved() },
@@ -454,7 +470,8 @@ fun CompressorApp(viewModel: CompressorViewModel) {
                                                     }
                                                 },
                                                 onCompressAnother = { viewModel.reset() },
-                                                onBack = { viewModel.reset() }
+                                                onBack = { viewModel.reset() },
+                                                onUndoReplace = { viewModel.undoReplaceOriginal(context) }
                                             )
                                         }
                                     }

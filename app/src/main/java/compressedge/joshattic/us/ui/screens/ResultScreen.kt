@@ -64,7 +64,8 @@ fun ResultScreen(
     onShare: () -> Unit,
     onSave: () -> Unit,
     onCompressAnother: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onUndoReplace: () -> Unit = {}
 ) {
     val uriHandler = LocalUriHandler.current
     val haptics = LocalHapticFeedback.current
@@ -244,6 +245,22 @@ fun ResultScreen(
         }
         
         Spacer(modifier = Modifier.height(16.dp))
+
+        if (state.pendingReplaceRollback.isNotEmpty()) {
+            TextButton(
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onUndoReplace()
+                }
+            ) {
+                Text(
+                    stringResource(R.string.undo_replace_original),
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         TextButton(
             onClick = {
