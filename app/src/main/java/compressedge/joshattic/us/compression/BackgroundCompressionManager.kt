@@ -24,7 +24,7 @@ object BackgroundCompressionManager {
         val error: String? = null,
         val errorLog: String? = null,
         val hdrWarning: String? = null,
-        val metadataWarning: String? = null,
+        val metadataWarnings: List<String> = emptyList(),
         val currentlyCompressingUri: Uri? = null,
         val currentlyCompressingIndex: Int = 0
     )
@@ -53,8 +53,10 @@ object BackgroundCompressionManager {
         _state.update { it.copy(hdrWarning = message) }
     }
 
-    fun setMetadataWarning(message: String) {
-        _state.update { it.copy(metadataWarning = message) }
+    fun addMetadataWarning(message: String) {
+        _state.update {
+            if (it.metadataWarnings.contains(message)) it else it.copy(metadataWarnings = it.metadataWarnings + message)
+        }
     }
 
     fun complete(uri: Uri, size: Long, uris: List<Uri> = emptyList()) {
