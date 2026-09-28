@@ -263,6 +263,7 @@ fun ResultScreen(
         }
 
         TextButton(
+            enabled = !state.isSaving,
             onClick = {
                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                 onCompressAnother()
