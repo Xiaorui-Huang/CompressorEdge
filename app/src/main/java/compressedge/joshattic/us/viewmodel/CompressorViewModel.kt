@@ -1400,9 +1400,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             try {
                 var savedNextToOriginal = 0
                 val fallbackUris = mutableListOf<Uri>()
+                var anyItemFound = false
                 for ((uri, originalUri) in items) {
                     val file = uri.path?.let { File(it) }
                     if (file == null || !file.exists()) continue
+                    anyItemFound = true
 
                     val relativePath = originalRelativePath(context, originalUri)
                     if (relativePath != null && insertVideoIntoMediaStore(context, file, file.name, relativePath) != null) {
@@ -1412,10 +1414,21 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
+                // Every item's temp file was already gone (e.g. clearCache() raced this) - nothing
+                // was saved anywhere, so this must not fall through to saveSuccess = true below.
+                if (!anyItemFound) {
+                    _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_file_lost)) }
+                    return@launch
+                }
+
                 if (fallbackUris.isNotEmpty()) {
                     val treeUri = currentState.customOutputTreeUri
                     if (!treeUri.isNullOrBlank()) {
-                        saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
+                        val treeOk = saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
+                        if (!treeOk && savedNextToOriginal == 0) {
+                            // Error already set by saveUrisToCustomTreeBlocking - don't overwrite it below.
+                            return@launch
+                        }
                     } else {
                         val fallbackSaved = saveUrisToGalleryBlocking(context, fallbackUris)
                         if (fallbackSaved == 0 && savedNextToOriginal == 0) {
@@ -1526,14 +1539,6 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch(Dispatchers.IO) {
-            // Deleting previous backup files is I/O and must not block the calling (likely Main)
-            // thread — deferred to here, inside the IO-dispatched coroutine, rather than running
-            // synchronously before launch().
-            if (previousRollback.isNotEmpty()) {
-                previousRollback.forEach { File(it.rollbackFilePath).delete() }
-                updateReplaceRollback(emptyList())
-            }
-
             // Declared outside the try block so `finally` can always persist whatever rollback
             // entries were recorded before any exception, even one from an unrelated later step
             // (e.g. writing fallback items) — a candidate whose original is already deleted and
@@ -1542,10 +1547,12 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             try {
                 val candidates = mutableListOf<Candidate>()
                 val fallbackUris = mutableListOf<Uri>()
+                var anyItemFound = false
 
                 for ((uri, originalUri) in items) {
                     val file = uri.path?.let { File(it) }
                     if (file == null || !file.exists()) continue
+                    anyItemFound = true
 
                     val relativePath = originalUri?.let { originalRelativePath(context, it) }
                     val displayName = originalUri?.let { queryDisplayName(context, it) }
@@ -1654,13 +1661,27 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
+                // Nothing to save at all (every item's temp file was already gone) - don't fall
+                // through to saveSuccess = true below.
+                if (!anyItemFound) {
+                    _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_file_lost)) }
+                    return@launch
+                }
+
                 if (fallbackUris.isNotEmpty()) {
                     val currentState = _uiState.value
                     val treeUri = currentState.customOutputTreeUri
-                    if (!treeUri.isNullOrBlank()) {
+                    val fallbackOk = if (!treeUri.isNullOrBlank()) {
+                        // Error already set by saveUrisToCustomTreeBlocking on failure.
                         saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
                     } else {
-                        saveUrisToGalleryBlocking(context, fallbackUris)
+                        saveUrisToGalleryBlocking(context, fallbackUris) > 0
+                    }
+                    if (!fallbackOk && newRollback.isEmpty()) {
+                        if (treeUri.isNullOrBlank()) {
+                            _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
+                        }
+                        return@launch
                     }
                 }
 
@@ -1671,10 +1692,15 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message))
                 }
             } finally {
-                // Always persisted, even if the try block above threw partway through: a candidate
-                // whose original was already deleted and replacement already inserted before the
-                // exception must keep its undo record.
+                // Only supersede the previous rollback once this run actually produced a new one -
+                // e.g. every candidate failed verification and fell back to a plain save, leaving
+                // newRollback empty. The previous run's still-valid Undo (backup + record) must stay
+                // intact in that case rather than being wiped out for a run that replaced nothing.
+                // Always persisted when non-empty, even if the try block above threw partway through:
+                // a candidate whose original was already deleted and replacement already inserted
+                // before the exception must keep its undo record.
                 if (newRollback.isNotEmpty()) {
+                    previousRollback.forEach { File(it.rollbackFilePath).delete() }
                     updateReplaceRollback(newRollback)
                 }
                 _uiState.update { it.copy(isSaving = false) }
@@ -2280,7 +2306,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
                     if (itemSourceTimestamp != null || itemSourceLocation != null) {
                         val metadataResult = withContext(Dispatchers.IO) {
-                            CompressionExecutor.checkMetadataPreservation(context, item.uri, outputFile.absolutePath)
+                            CompressionExecutor.checkMetadataPreservation(itemSourceTimestamp, itemSourceLocation, outputFile.absolutePath)
                         }
                         addMetadataPreservationWarnings(warningsAcc, metadataResult)
                     }
@@ -2530,7 +2556,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                                 compressedOriginalUris = itemsToProcess.take(bg.compressedUris.size).map { item -> item.uri },
                                 compressedSize = bg.compressedSize,
                                 totalSavedBytes = newTotal,
-                                warnings = (listOfNotNull(bg.hdrWarning) + bg.metadataWarnings).ifEmpty { null } ?: it.warnings
+                                // Merged with the plan warnings already set when the batch started
+                                // (it.warnings), not replaced - this collector only ever adds the
+                                // hdr/metadata warnings discovered during/after compression.
+                                warnings = (it.warnings + listOfNotNull(bg.hdrWarning) + bg.metadataWarnings).distinct()
                             )
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && _uiState.value.autoSaveToPhotos) {

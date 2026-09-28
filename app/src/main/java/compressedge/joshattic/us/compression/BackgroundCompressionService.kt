@@ -444,7 +444,7 @@ class BackgroundCompressionService : Service() {
 
                     if (params.sourceTimestamp != null || params.sourceLocation != null) {
                         val metadataResult = CompressionExecutor.checkMetadataPreservation(
-                            applicationContext, params.inputUri, params.outputPath
+                            params.sourceTimestamp, params.sourceLocation, params.outputPath
                         )
                         if (metadataResult.timestampPreserved == false) {
                             BackgroundCompressionManager.addMetadataWarning(getString(R.string.warning_metadata_date_not_preserved))

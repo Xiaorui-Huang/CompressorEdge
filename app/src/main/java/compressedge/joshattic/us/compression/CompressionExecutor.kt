@@ -181,6 +181,19 @@ object CompressionExecutor {
         return verifyOutputMp4Metadata(outputPath, timestamp, location)
     }
 
+    /**
+     * Same as [checkMetadataPreservation], but for callers that already read the source's
+     * timestamp/location earlier in the same flow (e.g. to populate [Params.sourceTimestamp]/
+     * [Params.sourceLocation] before compression) - avoids a second, redundant source-metadata read.
+     */
+    fun checkMetadataPreservation(
+        sourceTimestamp: Mp4TimestampData?,
+        sourceLocation: Mp4LocationData?,
+        outputPath: String
+    ): MetadataPreservationResult {
+        return verifyOutputMp4Metadata(outputPath, sourceTimestamp, sourceLocation)
+    }
+
     fun execute(
         context: Context,
         params: Params,
