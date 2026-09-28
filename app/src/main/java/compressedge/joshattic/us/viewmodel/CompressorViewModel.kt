@@ -94,6 +94,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
         private const val PREF_CUSTOM_OUTPUT_TREE_URI = "custom_output_tree_uri"
         private const val PREF_CUSTOM_OUTPUT_FOLDER_NAME = "custom_output_folder_name"
+        private const val PREF_SAVE_NEXT_TO_ORIGINAL = "save_next_to_original"
         private const val PREF_SAVED_VERSION_CODE = "saved_app_version_code"
         private const val PREF_FILENAME_SEGMENTS = "filename_segments_v2"
         private const val DEFAULT_FILENAME_SEGMENTS = "token:original_name|token:compressed"
@@ -112,6 +113,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val autoSaveToPhotos = autoSaveSupported && prefs.getBoolean("auto_save_photos", true)
         val customOutputTreeUri = prefs.getString(PREF_CUSTOM_OUTPUT_TREE_URI, null)
         val customOutputFolderName = prefs.getString(PREF_CUSTOM_OUTPUT_FOLDER_NAME, null)
+        val saveNextToOriginal = prefs.getBoolean(PREF_SAVE_NEXT_TO_ORIGINAL, false)
         val highConfig = loadQualityPresetConfig("preset_high", QualityPresetConfig(resolutionShortSide = 0, targetFps = 0, sizeRatio = 0.7f, audioBitrate = 320_000))
         val mediumConfig = loadQualityPresetConfig("preset_medium", QualityPresetConfig(resolutionShortSide = 1080, targetFps = 30, sizeRatio = 0.4f, audioBitrate = 192_000))
         val lowConfig = loadQualityPresetConfig("preset_low", QualityPresetConfig(resolutionShortSide = 720, targetFps = 30, sizeRatio = 0.2f, audioBitrate = 128_000))
@@ -146,6 +148,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             backgroundCompressionPrompted = backgroundCompressionPrompted,
             customOutputTreeUri = customOutputTreeUri,
             customOutputFolderName = customOutputFolderName,
+            saveNextToOriginal = saveNextToOriginal,
             highPresetConfig = highConfig,
             mediumPresetConfig = mediumConfig,
             lowPresetConfig = lowConfig,
@@ -1231,6 +1234,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun setSaveNextToOriginal(enabled: Boolean) {
+        prefs.edit { putBoolean(PREF_SAVE_NEXT_TO_ORIGINAL, enabled) }
+        _uiState.update { it.copy(saveNextToOriginal = enabled) }
+    }
+
     private fun releasePersistedTreeUri(context: Context, uriString: String?) {
         if (uriString.isNullOrBlank()) return
         try {
@@ -1257,14 +1265,172 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    /** Saves using the configured location: custom SAF folder, or default Photos gallery. */
+    /**
+     * Saves using the configured location: custom SAF folder, or default Photos gallery.
+     * When [CompressorUiState.saveNextToOriginal] is enabled, each file is saved next to its
+     * original source file when that's resolvable (i.e. the original lives in MediaStore, which
+     * covers the common "compressed a video from the gallery" case); any file that can't be
+     * placed next to its original falls back to the folder above.
+     */
     fun saveCompressedOutput(context: Context) {
-        val treeUri = _uiState.value.customOutputTreeUri
-        if (!treeUri.isNullOrBlank()) {
-            saveToCustomTree(context, Uri.parse(treeUri))
-        } else {
-            saveToGallery(context)
+        val currentState = _uiState.value
+        if (currentState.isSaving) return
+        val items = compressedItemsWithOriginals(currentState)
+        if (items.isEmpty()) return
+
+        if (!currentState.saveNextToOriginal) {
+            val treeUri = currentState.customOutputTreeUri
+            if (!treeUri.isNullOrBlank()) {
+                saveToCustomTree(context, Uri.parse(treeUri), items.map { it.first })
+            } else {
+                saveToGallery(context, items.map { it.first })
+            }
+            return
         }
+
+        _uiState.update { it.copy(isSaving = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                var savedNextToOriginal = 0
+                val fallbackUris = mutableListOf<Uri>()
+                for ((uri, originalUri) in items) {
+                    val file = uri.path?.let { File(it) }
+                    if (file == null || !file.exists()) continue
+
+                    val relativePath = originalRelativePath(context, originalUri)
+                    if (relativePath != null && insertVideoIntoMediaStore(context, file, file.name, relativePath)) {
+                        savedNextToOriginal++
+                    } else {
+                        fallbackUris.add(uri)
+                    }
+                }
+
+                if (fallbackUris.isNotEmpty()) {
+                    val treeUri = currentState.customOutputTreeUri
+                    if (!treeUri.isNullOrBlank()) {
+                        saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
+                    } else {
+                        val fallbackSaved = saveUrisToGalleryBlocking(context, fallbackUris)
+                        if (fallbackSaved == 0 && savedNextToOriginal == 0) {
+                            _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
+                            return@launch
+                        }
+                    }
+                }
+
+                _uiState.update { it.copy(saveSuccess = true) }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _uiState.update {
+                    it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message))
+                }
+            } finally {
+                _uiState.update { it.copy(isSaving = false) }
+            }
+        }
+    }
+
+    /** Pairs each pending compressed output with the source uri it was produced from, when known. */
+    private fun compressedItemsWithOriginals(state: CompressorUiState): List<Pair<Uri, Uri?>> {
+        val targetUris = if (state.compressedUris.isNotEmpty()) state.compressedUris else listOfNotNull(state.compressedUri)
+        return targetUris.mapIndexed { index, uri -> uri to state.compressedOriginalUris.getOrNull(index) }
+    }
+
+    /** The original file's MediaStore folder (e.g. "DCIM/Camera"), if the original is a MediaStore item we can read metadata for. */
+    private fun originalRelativePath(context: Context, originalUri: Uri?): String? {
+        if (originalUri == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        return try {
+            context.contentResolver.query(
+                originalUri,
+                arrayOf(MediaStore.MediaColumns.RELATIVE_PATH),
+                null, null, null
+            )?.use { cursor ->
+                val idx = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx)?.takeIf { it.isNotBlank() } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun insertVideoIntoMediaStore(context: Context, file: File, displayName: String, relativePath: String): Boolean {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
+            put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+                put(MediaStore.Video.Media.RELATIVE_PATH, relativePath)
+            }
+        }
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val itemUri = context.contentResolver.insert(collection, values) ?: return false
+        return try {
+            val copied = context.contentResolver.openOutputStream(itemUri)?.use { out ->
+                file.inputStream().use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
+                true
+            } ?: false
+
+            if (!copied) {
+                context.contentResolver.delete(itemUri, null, null)
+                return false
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                context.contentResolver.update(itemUri, values, null, null)
+            }
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            context.contentResolver.delete(itemUri, null, null)
+            false
+        }
+    }
+
+    /** Blocking (must run on an IO dispatcher) helper shared by [saveToGallery] and the next-to-original fallback path. */
+    private fun saveUrisToGalleryBlocking(context: Context, uris: List<Uri>): Int {
+        var savedCount = 0
+        for (uri in uris) {
+            val file = uri.path?.let { File(it) } ?: continue
+            if (!file.exists()) continue
+            if (insertVideoIntoMediaStore(context, file, file.name, Environment.DIRECTORY_MOVIES + "/Compressor Edge")) {
+                savedCount++
+            }
+        }
+        return savedCount
+    }
+
+    /** Blocking (must run on an IO dispatcher) helper shared by [saveToCustomTree] and the next-to-original fallback path. */
+    private fun saveUrisToCustomTreeBlocking(context: Context, treeUri: Uri, uris: List<Uri>): Boolean {
+        val tree = DocumentFile.fromTreeUri(context, treeUri)
+        if (tree == null || !tree.canWrite()) {
+            _uiState.update {
+                it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, "Folder not writable"))
+            }
+            return false
+        }
+
+        for (uri in uris) {
+            val file = uri.path?.let { File(it) } ?: continue
+            if (!file.exists()) continue
+
+            val targetName = file.name
+            tree.findFile(targetName)?.takeIf { it.isFile }?.delete()
+            val target = tree.createFile("video/mp4", targetName) ?: continue
+
+            context.contentResolver.openOutputStream(target.uri)?.use { out ->
+                file.inputStream().use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
+            }
+        }
+        return true
     }
 
     fun toggleRemoveAudio() {
@@ -1663,6 +1829,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                         progress = 1f,
                         compressedUri = lastUri,
                         compressedUris = completedUris,
+                        compressedOriginalUris = itemsToProcess.take(completedUris.size).map { item -> item.uri },
                         compressedSize = totalOutputSize,
                         totalSavedBytes = newTotal
                     )
@@ -1858,6 +2025,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                                 progress = 1f,
                                 compressedUri = bg.compressedUri,
                                 compressedUris = bg.compressedUris,
+                                compressedOriginalUris = itemsToProcess.take(bg.compressedUris.size).map { item -> item.uri },
                                 compressedSize = bg.compressedSize,
                                 totalSavedBytes = newTotal,
                                 warnings = bg.hdrWarning?.let { w -> listOf(w) } ?: it.warnings
@@ -2158,41 +2326,15 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private fun saveToCustomTree(context: Context, treeUri: Uri) {
-        val currentState = _uiState.value
-        if (currentState.isSaving) return
-        val targetUris = if (currentState.compressedUris.isNotEmpty()) currentState.compressedUris else listOfNotNull(currentState.compressedUri)
+    private fun saveToCustomTree(context: Context, treeUri: Uri, targetUris: List<Uri>) {
         if (targetUris.isEmpty()) return
-
         _uiState.update { it.copy(isSaving = true) }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val tree = DocumentFile.fromTreeUri(context, treeUri)
-                if (tree == null || !tree.canWrite()) {
-                    _uiState.update {
-                        it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, "Folder not writable"))
-                    }
-                    return@launch
+                if (saveUrisToCustomTreeBlocking(context, treeUri, targetUris)) {
+                    _uiState.update { it.copy(saveSuccess = true) }
                 }
-
-                for (uri in targetUris) {
-                    val pathStr = uri.path ?: continue
-                    val file = File(pathStr)
-                    if (!file.exists()) continue
-
-                    val targetName = file.name
-                    tree.findFile(targetName)?.takeIf { it.isFile }?.delete()
-                    val target = tree.createFile("video/mp4", targetName) ?: continue
-
-                    context.contentResolver.openOutputStream(target.uri)?.use { out ->
-                        file.inputStream().use { input ->
-                            input.copyTo(out, COPY_BUFFER_BYTES)
-                        }
-                    }
-                }
-
-                _uiState.update { it.copy(saveSuccess = true) }
             } catch (e: Exception) {
                 e.printStackTrace()
                 _uiState.update {
@@ -2204,60 +2346,18 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun saveToGallery(context: Context) {
+    fun saveToGallery(context: Context, targetUris: List<Uri>? = null) {
         val currentState = _uiState.value
         if (currentState.isSaving) return
-        val targetUris = if (currentState.compressedUris.isNotEmpty()) currentState.compressedUris else listOfNotNull(currentState.compressedUri)
-        if (targetUris.isEmpty()) return
-        
+        val uris = targetUris ?: compressedItemsWithOriginals(currentState).map { it.first }
+        if (uris.isEmpty()) return
+
         _uiState.update { it.copy(isSaving = true) }
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                var anySaved = false
-                for (uri in targetUris) {
-                    val pathStr = uri.path ?: continue
-                    val file = File(pathStr)
-                    if (!file.exists()) continue
-
-                    val targetName = file.name
-
-                    val values = ContentValues().apply {
-                        put(MediaStore.Video.Media.DISPLAY_NAME, targetName)
-                        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                        put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
-                        put(MediaStore.Video.Media.DATE_MODIFIED, System.currentTimeMillis() / 1000)
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            put(MediaStore.Video.Media.IS_PENDING, 1)
-                            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Compressor Edge")
-                        }
-                    }
-
-                    val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                    } else {
-                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                    }
-
-                    val itemUri = context.contentResolver.insert(collection, values)
-                    if (itemUri != null) {
-                        context.contentResolver.openOutputStream(itemUri)?.use { out ->
-                            file.inputStream().use { input ->
-                                input.copyTo(out, COPY_BUFFER_BYTES)
-                            }
-                        }
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            values.clear()
-                            values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                            context.contentResolver.update(itemUri, values, null, null)
-                        }
-                        anySaved = true
-                    }
-                }
-                
-                if (anySaved) {
+                val savedCount = saveUrisToGalleryBlocking(context, uris)
+                if (savedCount > 0) {
                     _uiState.update { it.copy(saveSuccess = true) }
                 } else {
                     _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }

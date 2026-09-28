@@ -329,6 +329,7 @@ fun CompressorApp(viewModel: CompressorViewModel) {
                                     openDocumentTreeLauncher.launch(initial)
                                 },
                                 onResetOutputLocation = { viewModel.clearCustomOutputFolder(context) },
+                                onToggleSaveNextToOriginal = { viewModel.setSaveNextToOriginal(!state.saveNextToOriginal) },
                                 onToggleShowBitrate = { viewModel.toggleShowBitrate() },
                                 onToggleBitrateUnit = { viewModel.toggleBitrateUnit() },
                                 onToggleShowStorageSaved = { viewModel.toggleShowStorageSaved() },
