@@ -992,6 +992,21 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    // Set when saveCompressedOutput() is called while a previous save/replace (or an undo) is still
+    // in flight - e.g. replace-original's backup+delete+insert I/O outlasting the next batch item's
+    // compression. Rather than silently dropping that call (compressedItemsWithOriginals() folds in
+    // every completed item, so a dropped call for the last item in a batch would never be retried by
+    // a later call), the in-flight operation's own finally block re-invokes saveCompressedOutput once
+    // it's done, picking up the now-current full item list.
+    private var pendingSaveRetry = false
+
+    private fun maybeRetrySave(context: Context) {
+        if (pendingSaveRetry) {
+            pendingSaveRetry = false
+            saveCompressedOutput(context)
+        }
+    }
+
     /** Persists [CompressorUiState.pendingReplaceRollback] and updates state together, so the two never drift apart. */
     private fun updateReplaceRollback(newList: List<ReplaceRollbackEntry>) {
         _uiState.update { it.copy(pendingReplaceRollback = newList) }
@@ -1020,10 +1035,16 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun loadReplaceRollback(): List<ReplaceRollbackEntry> {
         val str = prefs.getString(PREF_REPLACE_ROLLBACK, null) ?: return emptyList()
-        return try {
-            val array = JSONArray(str)
-            val list = mutableListOf<ReplaceRollbackEntry>()
-            for (i in 0 until array.length()) {
+        val array = try {
+            JSONArray(str)
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        val list = mutableListOf<ReplaceRollbackEntry>()
+        for (i in 0 until array.length()) {
+            // Parsed per-entry: a single malformed record (e.g. from an interrupted prior write)
+            // must not discard the whole persisted list and strand otherwise-valid undo records.
+            try {
                 val obj = array.getJSONObject(i)
                 val entry = ReplaceRollbackEntry(
                     rollbackFilePath = obj.getString("rollbackFilePath"),
@@ -1036,11 +1057,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 if (File(entry.rollbackFilePath).exists()) {
                     list.add(entry)
                 }
+            } catch (e: Exception) {
+                // Skip just this entry.
             }
-            list
-        } catch (e: Exception) {
-            emptyList()
         }
+        return list
     }
 
     private fun saveTargetSizePresets(list: List<compressedge.joshattic.us.model.TargetSizePreset>) {
@@ -1339,7 +1360,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
      */
     fun saveCompressedOutput(context: Context) {
         val currentState = _uiState.value
-        if (currentState.isSaving) return
+        if (currentState.isSaving) {
+            pendingSaveRetry = true
+            return
+        }
         val items = compressedItemsWithOriginals(currentState)
         if (items.isEmpty()) return
 
@@ -1396,6 +1420,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
+                maybeRetrySave(context)
             }
         }
     }
@@ -1422,37 +1447,48 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     /** Restores the most recent replace-original save: deletes the replacement and re-inserts the backed-up original. */
     fun undoReplaceOriginal(context: Context) {
+        // Shares the isSaving flag with saveCompressedOutput()/replaceOriginals(): both read-modify-
+        // write pendingReplaceRollback and touch the same backup files, so letting them overlap risks
+        // one clobbering the other's just-written rollback state. If a save/replace is in flight,
+        // decline for now rather than racing it - the Undo button stays visible so the user can retry.
+        if (_uiState.value.isSaving) return
         val rollback = _uiState.value.pendingReplaceRollback
         if (rollback.isEmpty()) return
         updateReplaceRollback(emptyList())
+        _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch(Dispatchers.IO) {
             // An entry whose restore fails stays in stillPending (re-surfacing the Undo option) rather
             // than being silently dropped — and, same as replaceOriginals, the backup file is only
             // deleted once the restore actually landed, so a failed restore never loses the last copy.
             val stillPending = mutableListOf<ReplaceRollbackEntry>()
-            for (entry in rollback) {
-                try {
-                    context.contentResolver.delete(Uri.parse(entry.insertedMediaUri), null, null)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-                val backupFile = File(entry.rollbackFilePath)
-                if (backupFile.exists()) {
-                    val restored = try {
-                        insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath) != null
+            try {
+                for (entry in rollback) {
+                    try {
+                        context.contentResolver.delete(Uri.parse(entry.insertedMediaUri), null, null)
                     } catch (e: Exception) {
                         e.printStackTrace()
-                        false
                     }
-                    if (restored) {
-                        backupFile.delete()
-                    } else {
-                        stillPending.add(entry)
+                    val backupFile = File(entry.rollbackFilePath)
+                    if (backupFile.exists()) {
+                        val restored = try {
+                            insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath) != null
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            false
+                        }
+                        if (restored) {
+                            backupFile.delete()
+                        } else {
+                            stillPending.add(entry)
+                        }
                     }
                 }
-            }
-            if (stillPending.isNotEmpty()) {
-                updateReplaceRollback(stillPending)
+                if (stillPending.isNotEmpty()) {
+                    updateReplaceRollback(stillPending)
+                }
+            } finally {
+                _uiState.update { it.copy(isSaving = false) }
+                maybeRetrySave(context)
             }
         }
     }
@@ -1469,13 +1505,17 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         data class Candidate(val compressedFile: File, val originalUri: Uri, val relativePath: String, val displayName: String)
 
         val previousRollback = _uiState.value.pendingReplaceRollback
-        if (previousRollback.isNotEmpty()) {
-            previousRollback.forEach { File(it.rollbackFilePath).delete() }
-            updateReplaceRollback(emptyList())
-        }
 
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch(Dispatchers.IO) {
+            // Deleting previous backup files is I/O and must not block the calling (likely Main)
+            // thread — deferred to here, inside the IO-dispatched coroutine, rather than running
+            // synchronously before launch().
+            if (previousRollback.isNotEmpty()) {
+                previousRollback.forEach { File(it.rollbackFilePath).delete() }
+                updateReplaceRollback(emptyList())
+            }
+
             // Declared outside the try block so `finally` can always persist whatever rollback
             // entries were recorded before any exception, even one from an unrelated later step
             // (e.g. writing fallback items) — a candidate whose original is already deleted and
@@ -1620,6 +1660,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     updateReplaceRollback(newRollback)
                 }
                 _uiState.update { it.copy(isSaving = false) }
+                maybeRetrySave(context)
             }
         }
     }
