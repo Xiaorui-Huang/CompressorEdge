@@ -57,6 +57,7 @@
     <string name="warning_hdr_tone_mapped">HDR video was tone-mapped to SDR to avoid encoder compatibility issues on this device. Use AV1 if you need to preserve HDR.</string>
     <string name="warning_metadata_date_not_preserved">Couldn\'t preserve the original creation date on this file.</string>
     <string name="warning_metadata_location_not_preserved">Couldn\'t preserve the original GPS location on this file.</string>
+    <string name="warning_partial_save_failure">%1$d of %2$d files could not be saved.</string>
     <string name="warning_details">Warning Details</string>
     <string name="dismiss">Dismiss</string>
     <string name="target_size_warning">Target size not possible, tap for info</string>
