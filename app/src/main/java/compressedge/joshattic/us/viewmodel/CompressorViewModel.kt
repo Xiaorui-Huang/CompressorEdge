@@ -170,6 +170,18 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         checkSupportedCodecs()
         checkSupportedAudioCodecs()
         clearCache()
+
+        if (pendingReplaceRollback.isNotEmpty()) {
+            // Filtering out entries whose backup file no longer exists (e.g. swept by
+            // purgeStaleRollbackFiles) requires a disk stat per entry - deferred off the main
+            // thread rather than done inline in loadReplaceRollback(), which init calls synchronously.
+            viewModelScope.launch(Dispatchers.IO) {
+                val stillValid = pendingReplaceRollback.filter { File(it.rollbackFilePath).exists() }
+                if (stillValid.size != pendingReplaceRollback.size) {
+                    updateReplaceRollback(stillValid)
+                }
+            }
+        }
     }
 
     fun dismissWhatsNewDialog() {
@@ -1044,19 +1056,20 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         for (i in 0 until array.length()) {
             // Parsed per-entry: a single malformed record (e.g. from an interrupted prior write)
             // must not discard the whole persisted list and strand otherwise-valid undo records.
+            // Deliberately no File.exists() check here - this is called synchronously from init on
+            // the main thread, and per-entry disk stats there would be blocking I/O. Stale entries
+            // (backup file no longer present) are filtered out afterward, off the main thread - see
+            // the call site in init.
             try {
                 val obj = array.getJSONObject(i)
-                val entry = ReplaceRollbackEntry(
-                    rollbackFilePath = obj.getString("rollbackFilePath"),
-                    insertedMediaUri = obj.getString("insertedMediaUri"),
-                    originalDisplayName = obj.getString("originalDisplayName"),
-                    originalRelativePath = obj.getString("originalRelativePath")
+                list.add(
+                    ReplaceRollbackEntry(
+                        rollbackFilePath = obj.getString("rollbackFilePath"),
+                        insertedMediaUri = obj.getString("insertedMediaUri"),
+                        originalDisplayName = obj.getString("originalDisplayName"),
+                        originalRelativePath = obj.getString("originalRelativePath")
+                    )
                 )
-                // Only keep entries whose backup file is actually still there (e.g. survived a
-                // prior stale-file sweep) - a stale entry pointing at a deleted file can't be undone.
-                if (File(entry.rollbackFilePath).exists()) {
-                    list.add(entry)
-                }
             } catch (e: Exception) {
                 // Skip just this entry.
             }
@@ -1463,24 +1476,29 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             val stillPending = mutableListOf<ReplaceRollbackEntry>()
             try {
                 for (entry in rollback) {
+                    val backupFile = File(entry.rollbackFilePath)
+                    if (!backupFile.exists()) {
+                        // No backup to restore from (e.g. swept by purgeStaleRollbackFiles) - keep the
+                        // entry pending rather than deleting the replacement anyway, which would leave
+                        // neither file with no way to recover.
+                        stillPending.add(entry)
+                        continue
+                    }
                     try {
                         context.contentResolver.delete(Uri.parse(entry.insertedMediaUri), null, null)
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
-                    val backupFile = File(entry.rollbackFilePath)
-                    if (backupFile.exists()) {
-                        val restored = try {
-                            insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath) != null
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                            false
-                        }
-                        if (restored) {
-                            backupFile.delete()
-                        } else {
-                            stillPending.add(entry)
-                        }
+                    val restored = try {
+                        insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath) != null
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        false
+                    }
+                    if (restored) {
+                        backupFile.delete()
+                    } else {
+                        stillPending.add(entry)
                     }
                 }
                 if (stillPending.isNotEmpty()) {
