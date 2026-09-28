@@ -16,7 +16,10 @@ data class ReplaceRollbackEntry(
     /** Internal-storage copy of the original file, made before it was deleted. */
     val rollbackFilePath: String,
     /** The MediaStore uri the compressed file was inserted at, in place of the deleted original. */
-    val insertedMediaUri: String
+    val insertedMediaUri: String,
+    /** The original's display name and MediaStore relative path, needed to restore it on undo. */
+    val originalDisplayName: String,
+    val originalRelativePath: String
 )
 
 val defaultTargetSizePresets = listOf(
