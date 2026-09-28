@@ -1673,7 +1673,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 val itemRequestedFps = item.targetFpsOverride ?: currentState.targetFps
 
                 val plan = withContext(Dispatchers.IO) {
-                    val probe = probeTracks(context, item.uri)
+                    val probe = probeTracksCached(context, item.uri)
                     buildCompressionPlan(probe, currentState, itemRequestedShortSide, itemRequestedFps)
                 }
                 if (plan.blockingError != null) {
@@ -1875,7 +1875,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             val itemRequestedFps = item.targetFpsOverride ?: currentState.targetFps
 
             val plan = withContext(Dispatchers.IO) {
-                val probe = probeTracks(context, item.uri)
+                val probe = probeTracksCached(context, item.uri)
                 buildCompressionPlan(probe, currentState, itemRequestedShortSide, itemRequestedFps)
             }
             if (plan.blockingError != null) {
