@@ -1,0 +1,94 @@
+name: VMAF spike - single-ABI libvmaf size/build check
+
+# Throwaway measurement workflow for the A1 TODO item (see TODO.md "A1 - VMAF").
+# Does NOT touch the app - it cross-compiles libvmaf for arm64-v8a only, outside the
+# Gradle/AGP build, purely to get a real .so + model-asset size number and confirm the
+# cross-build actually works before any app-side integration is attempted. Delete this
+# workflow (and the feature/vmaf-spike branch) once A1's go/no-go decision is made.
+
+on:
+  push:
+    branches:
+      - feature/vmaf-spike
+  workflow_dispatch:
+
+jobs:
+  vmaf-cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install NDK and build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build nasm xxd pkg-config
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install requested NDK version via sdkmanager
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
+
+      - name: Checkout vmaf source (pinned tag)
+        uses: actions/checkout@v4
+        with:
+          repository: Netflix/vmaf
+          ref: v3.0.0
+          path: vmaf-src
+
+      - name: Write Android arm64 meson cross file
+        run: |
+          NDK="$ANDROID_NDK_HOME"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          API=26
+          cat > android-arm64.meson.cross <<EOF
+          [binaries]
+          c = '$TOOLCHAIN/bin/aarch64-linux-android${API}-clang'
+          cpp = '$TOOLCHAIN/bin/aarch64-linux-android${API}-clang++'
+          ar = '$TOOLCHAIN/bin/llvm-ar'
+          strip = '$TOOLCHAIN/bin/llvm-strip'
+          pkgconfig = 'pkg-config'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          EOF
+          cat android-arm64.meson.cross
+
+      - name: Configure libvmaf (arm64-v8a only, no CLI tools, static model bundled)
+        working-directory: vmaf-src/libvmaf
+        run: |
+          meson setup build \
+            --cross-file ../../android-arm64.meson.cross \
+            --default-library shared \
+            -Denable_cuda=false \
+            -Dbuilt_in_models=true \
+            -Denable_avx512=false \
+            -Denable_tests=false \
+            -Denable_docs=false \
+            -Dbuildtype=release
+
+      - name: Build libvmaf
+        working-directory: vmaf-src/libvmaf
+        run: ninja -C build
+
+      - name: Report sizes
+        working-directory: vmaf-src/libvmaf
+        run: |
+          echo "== libvmaf.so (unstripped) =="
+          find build -name "libvmaf.so*" -exec ls -lh {} \;
+          echo "== stripped size =="
+          SO=$(find build -name "libvmaf.so" | head -1)
+          cp "$SO" /tmp/libvmaf.so
+          "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip /tmp/libvmaf.so
+          ls -lh /tmp/libvmaf.so
+          echo "== bundled built-in model size (source, before any stripping) =="
+          find ../model -name "*.json" -o -name "*.pkl" | xargs ls -lh 2>/dev/null || true
+
+      - name: Upload stripped .so as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvmaf-arm64-v8a
+          path: /tmp/libvmaf.so
