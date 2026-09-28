@@ -177,6 +177,11 @@ fun CompressorApp(viewModel: CompressorViewModel) {
     }
     LaunchedEffect(state.pendingDeleteRequest) {
         state.pendingDeleteRequest?.let { intentSender ->
+            // Clear immediately, before launching: if a config change or other recomposition tears
+            // down and rebuilds this composable while the system dialog is still open, the surviving
+            // ViewModel's state must already read null so this effect doesn't fire a second launch
+            // for the same request.
+            viewModel.consumePendingDeleteRequest()
             deleteConsentLauncher.launch(
                 androidx.activity.result.IntentSenderRequest.Builder(intentSender).build()
             )

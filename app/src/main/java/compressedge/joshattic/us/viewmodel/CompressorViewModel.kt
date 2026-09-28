@@ -1348,9 +1348,20 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     private var pendingDeleteConsent: CompletableDeferred<Boolean>? = null
 
-    /** Called by the UI after launching [CompressorUiState.pendingDeleteRequest] and getting a result back. */
-    fun onDeleteRequestResult(granted: Boolean) {
+    /**
+     * Called by the UI right after it launches [CompressorUiState.pendingDeleteRequest], before the
+     * result comes back — clears the state field immediately so a recomposition or config change
+     * while the system dialog is still open (the ViewModel survives; the Activity/Compose tree
+     * doesn't) can't see a non-null pendingDeleteRequest and launch the same IntentSender a second
+     * time. The actual wait for the user's answer happens via [pendingDeleteConsent], independent of
+     * this state field.
+     */
+    fun consumePendingDeleteRequest() {
         _uiState.update { it.copy(pendingDeleteRequest = null) }
+    }
+
+    /** Called by the UI after getting the launched request's result back. */
+    fun onDeleteRequestResult(granted: Boolean) {
         pendingDeleteConsent?.complete(granted)
         pendingDeleteConsent = null
     }
@@ -1395,6 +1406,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
         _uiState.update { it.copy(isSaving = true) }
         viewModelScope.launch(Dispatchers.IO) {
+            // Declared outside the try block so `finally` can always persist whatever rollback
+            // entries were recorded before any exception, even one from an unrelated later step
+            // (e.g. writing fallback items) — a candidate whose original is already deleted and
+            // replacement already inserted must never lose its undo record.
+            val newRollback = mutableListOf<ReplaceRollbackEntry>()
             try {
                 val candidates = mutableListOf<Candidate>()
                 val fallbackUris = mutableListOf<Uri>()
@@ -1437,8 +1453,6 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
-                val newRollback = mutableListOf<ReplaceRollbackEntry>()
-
                 if (backedUp.isNotEmpty()) {
                     val deletedOk: Map<Candidate, Boolean> = when {
                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
@@ -1468,20 +1482,36 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                             fallbackUris.add(Uri.fromFile(candidate.compressedFile))
                             continue
                         }
-                        val insertedUri = insertVideoIntoMediaStore(context, candidate.compressedFile, candidate.displayName, candidate.relativePath)
-                        if (insertedUri != null) {
-                            newRollback.add(
-                                ReplaceRollbackEntry(
-                                    rollbackFilePath = backupFile.absolutePath,
-                                    insertedMediaUri = insertedUri.toString(),
-                                    originalDisplayName = candidate.displayName,
-                                    originalRelativePath = candidate.relativePath
+                        // Isolated per candidate: an unexpected exception here (insertVideoIntoMediaStore's
+                        // own contentResolver.insert() call isn't itself try/caught) must not abort the
+                        // whole batch and lose already-recorded rollback entries for prior candidates —
+                        // the original for THIS candidate is already deleted, so restore-from-backup is
+                        // the same safe fallback as an ordinary insert failure.
+                        try {
+                            val insertedUri = insertVideoIntoMediaStore(context, candidate.compressedFile, candidate.displayName, candidate.relativePath)
+                            if (insertedUri != null) {
+                                newRollback.add(
+                                    ReplaceRollbackEntry(
+                                        rollbackFilePath = backupFile.absolutePath,
+                                        insertedMediaUri = insertedUri.toString(),
+                                        originalDisplayName = candidate.displayName,
+                                        originalRelativePath = candidate.relativePath
+                                    )
                                 )
-                            )
-                        } else {
-                            // Delete succeeded but insert failed (e.g. storage full): restore the
-                            // original immediately from backup rather than leaving neither file.
-                            insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath)
+                            } else {
+                                // Delete succeeded but insert failed (e.g. storage full): restore the
+                                // original immediately from backup rather than leaving neither file.
+                                insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath)
+                                backupFile.delete()
+                                fallbackUris.add(Uri.fromFile(candidate.compressedFile))
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            try {
+                                insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath)
+                            } catch (restoreError: Exception) {
+                                restoreError.printStackTrace()
+                            }
                             backupFile.delete()
                             fallbackUris.add(Uri.fromFile(candidate.compressedFile))
                         }
@@ -1498,13 +1528,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
-                _uiState.update { it.copy(saveSuccess = true, pendingReplaceRollback = newRollback) }
+                _uiState.update { it.copy(saveSuccess = true) }
             } catch (e: Exception) {
                 e.printStackTrace()
                 _uiState.update {
                     it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message))
                 }
             } finally {
+                // Always persisted, even if the try block above threw partway through: a candidate
+                // whose original was already deleted and replacement already inserted before the
+                // exception must keep its undo record.
+                if (newRollback.isNotEmpty()) {
+                    _uiState.update { it.copy(pendingReplaceRollback = newRollback) }
+                }
                 _uiState.update { it.copy(isSaving = false) }
             }
         }
