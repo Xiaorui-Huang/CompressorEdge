@@ -1424,17 +1424,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 if (fallbackUris.isNotEmpty()) {
                     val treeUri = currentState.customOutputTreeUri
                     if (!treeUri.isNullOrBlank()) {
-                        val treeOk = saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
-                        if (!treeOk && savedNextToOriginal == 0) {
+                        val treeSaved = saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
+                        if (treeSaved == 0 && savedNextToOriginal == 0) {
                             // Error already set by saveUrisToCustomTreeBlocking - don't overwrite it below.
                             return@launch
                         }
+                        addPartialSaveWarning(treeSaved, fallbackUris.size)
                     } else {
                         val fallbackSaved = saveUrisToGalleryBlocking(context, fallbackUris)
                         if (fallbackSaved == 0 && savedNextToOriginal == 0) {
                             _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
                             return@launch
                         }
+                        addPartialSaveWarning(fallbackSaved, fallbackUris.size)
                     }
                 }
 
@@ -1671,18 +1673,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 if (fallbackUris.isNotEmpty()) {
                     val currentState = _uiState.value
                     val treeUri = currentState.customOutputTreeUri
-                    val fallbackOk = if (!treeUri.isNullOrBlank()) {
+                    val fallbackSaved = if (!treeUri.isNullOrBlank()) {
                         // Error already set by saveUrisToCustomTreeBlocking on failure.
                         saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
                     } else {
-                        saveUrisToGalleryBlocking(context, fallbackUris) > 0
+                        saveUrisToGalleryBlocking(context, fallbackUris)
                     }
-                    if (!fallbackOk && newRollback.isEmpty()) {
+                    if (fallbackSaved == 0 && newRollback.isEmpty()) {
                         if (treeUri.isNullOrBlank()) {
                             _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
                         }
                         return@launch
                     }
+                    addPartialSaveWarning(fallbackSaved, fallbackUris.size)
                 }
 
                 _uiState.update { it.copy(saveSuccess = true) }
@@ -1914,20 +1917,21 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         return savedCount
     }
 
-    /** Blocking (must run on an IO dispatcher) helper shared by [saveToCustomTree] and the next-to-original fallback path. */
     /**
-     * Returns whether at least one file was actually written, not just whether the tree itself was
-     * writable - a target folder that's writable but where every individual file write fails (name
-     * collision the provider won't resolve, per-file quota, a mid-copy exception) must not be
-     * reported as success to callers deciding whether to fall back or show an error.
+     * Blocking (must run on an IO dispatcher) helper shared by [saveToCustomTree] and the
+     * next-to-original/replace-original fallback paths. Returns how many files were actually
+     * written, not just whether the tree itself was writable - a target folder that's writable but
+     * where an individual file write fails (name collision the provider won't resolve, per-file
+     * quota, a mid-copy exception) must not be silently counted as saved. Callers compare the count
+     * against `uris.size` to detect a partial failure - see [addPartialSaveWarning].
      */
-    private fun saveUrisToCustomTreeBlocking(context: Context, treeUri: Uri, uris: List<Uri>): Boolean {
+    private fun saveUrisToCustomTreeBlocking(context: Context, treeUri: Uri, uris: List<Uri>): Int {
         val tree = DocumentFile.fromTreeUri(context, treeUri)
         if (tree == null || !tree.canWrite()) {
             _uiState.update {
                 it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, "Folder not writable"))
             }
-            return false
+            return 0
         }
 
         var savedCount = 0
@@ -1949,7 +1953,18 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             }
             if (wrote) savedCount++
         }
-        return savedCount > 0
+        return savedCount
+    }
+
+    /** Appends a dedup'd warning when only some of a batch's files were actually saved. */
+    private fun addPartialSaveWarning(savedCount: Int, totalCount: Int) {
+        if (savedCount <= 0 || savedCount >= totalCount) return
+        val msg = getApplication<Application>().getString(
+            R.string.warning_partial_save_failure, totalCount - savedCount, totalCount
+        )
+        _uiState.update { state ->
+            if (state.warnings.contains(msg)) state else state.copy(warnings = (state.warnings + msg).distinct())
+        }
     }
 
     fun toggleRemoveAudio() {
@@ -2903,7 +2918,9 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                if (saveUrisToCustomTreeBlocking(context, treeUri, targetUris)) {
+                val savedCount = saveUrisToCustomTreeBlocking(context, treeUri, targetUris)
+                if (savedCount > 0) {
+                    addPartialSaveWarning(savedCount, targetUris.size)
                     _uiState.update { it.copy(saveSuccess = true) }
                 }
             } catch (e: Exception) {
@@ -2930,6 +2947,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             try {
                 val savedCount = saveUrisToGalleryBlocking(context, uris)
                 if (savedCount > 0) {
+                    addPartialSaveWarning(savedCount, uris.size)
                     _uiState.update { it.copy(saveSuccess = true) }
                 } else {
                     _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
