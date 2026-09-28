@@ -47,11 +47,26 @@ To update after upstream releases: `git fetch compressor && git checkout
 sync/compressor-upstream && git merge compressor/main`, fix whatever that
 needs (commit directly on `sync/compressor-upstream`), then on each
 `feature/*` branch `git rebase sync/compressor-upstream` (resolving any
-conflicts with the new upstream code there, not on `personal/edge`), then
-rebuild `personal/edge` by re-merging all `feature/*` branches into a fresh
-branch off the updated `sync/compressor-upstream` (recreating the merges is
-simpler and safer than trying to rebase a branch that itself has merge
-commits).
+conflicts with the new upstream code there, not on `personal/edge`, and
+force-pushing each `feature/*` branch afterward since rebase rewrites it —
+fine here since these are personal working branches, not something anyone
+else builds a PR on top of).
+
+Then rebuild `personal/edge` itself: don't try to rebase it (it has merge
+commits, which rebase mangles) — instead build a throwaway branch the same
+way it was first built (`git checkout -b personal/edge-next
+sync/compressor-upstream`, then `git merge --no-ff` each `feature/*`
+branch in turn, then re-copy `CLAUDE.md`/`TODO.md` if they changed), verify
+it (`git diff personal/edge personal/edge-next` should show only the
+changes you expect — new upstream code plus whatever the features'
+rebases picked up), then move the `personal/edge` ref onto it: `git branch
+-f personal/edge personal/edge-next && git checkout personal/edge && git
+branch -D personal/edge-next`. This **rewrites `personal/edge`'s history**
+(same reason as the `feature/*` rebases above), so a `git push --force
+origin personal/edge` is required afterward, and any in-flight PR opened
+from `personal/edge` or local checkout tracking its old tip will need to
+be rebased or recreated — acceptable for a personal integration branch
+nobody else bases work on, but confirm that's still true before forcing.
 
 To add a new feature: branch it off the current `sync/compressor-upstream`
 tip (not off `personal/edge`), then merge it into `personal/edge` once it's
