@@ -98,6 +98,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         private const val PREF_CUSTOM_OUTPUT_FOLDER_NAME = "custom_output_folder_name"
         private const val PREF_SAVE_NEXT_TO_ORIGINAL = "save_next_to_original"
         private const val PREF_REPLACE_ORIGINAL = "replace_original"
+        private const val PREF_REPLACE_ROLLBACK = "replace_rollback_entries"
         private const val REPLACE_ROLLBACK_MAX_AGE_MS = 3L * 24 * 60 * 60 * 1000
         private const val PREF_SAVED_VERSION_CODE = "saved_app_version_code"
         private const val PREF_FILENAME_SEGMENTS = "filename_segments_v2"
@@ -119,6 +120,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val customOutputFolderName = prefs.getString(PREF_CUSTOM_OUTPUT_FOLDER_NAME, null)
         val saveNextToOriginal = prefs.getBoolean(PREF_SAVE_NEXT_TO_ORIGINAL, false)
         val replaceOriginal = prefs.getBoolean(PREF_REPLACE_ORIGINAL, false)
+        val pendingReplaceRollback = loadReplaceRollback()
         val highConfig = loadQualityPresetConfig("preset_high", QualityPresetConfig(resolutionShortSide = 0, targetFps = 0, sizeRatio = 0.7f, audioBitrate = 320_000))
         val mediumConfig = loadQualityPresetConfig("preset_medium", QualityPresetConfig(resolutionShortSide = 1080, targetFps = 30, sizeRatio = 0.4f, audioBitrate = 192_000))
         val lowConfig = loadQualityPresetConfig("preset_low", QualityPresetConfig(resolutionShortSide = 720, targetFps = 30, sizeRatio = 0.2f, audioBitrate = 128_000))
@@ -155,6 +157,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             customOutputFolderName = customOutputFolderName,
             saveNextToOriginal = saveNextToOriginal,
             replaceOriginal = replaceOriginal,
+            pendingReplaceRollback = pendingReplaceRollback,
             highPresetConfig = highConfig,
             mediumPresetConfig = mediumConfig,
             lowPresetConfig = lowConfig,
@@ -989,6 +992,57 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    /** Persists [CompressorUiState.pendingReplaceRollback] and updates state together, so the two never drift apart. */
+    private fun updateReplaceRollback(newList: List<ReplaceRollbackEntry>) {
+        _uiState.update { it.copy(pendingReplaceRollback = newList) }
+        saveReplaceRollback(newList)
+    }
+
+    /**
+     * Undo records are plain in-memory ViewModel state by default, but the backup files they point
+     * to are written to durable internal storage and can outlive the process — persist the records
+     * too, so a process death between a replace and pressing Undo doesn't strand a backed-up
+     * original with no way to find it again (before the stale-file sweep eventually deletes it).
+     */
+    private fun saveReplaceRollback(list: List<ReplaceRollbackEntry>) {
+        val array = JSONArray()
+        for (entry in list) {
+            val obj = JSONObject().apply {
+                put("rollbackFilePath", entry.rollbackFilePath)
+                put("insertedMediaUri", entry.insertedMediaUri)
+                put("originalDisplayName", entry.originalDisplayName)
+                put("originalRelativePath", entry.originalRelativePath)
+            }
+            array.put(obj)
+        }
+        prefs.edit { putString(PREF_REPLACE_ROLLBACK, array.toString()) }
+    }
+
+    private fun loadReplaceRollback(): List<ReplaceRollbackEntry> {
+        val str = prefs.getString(PREF_REPLACE_ROLLBACK, null) ?: return emptyList()
+        return try {
+            val array = JSONArray(str)
+            val list = mutableListOf<ReplaceRollbackEntry>()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val entry = ReplaceRollbackEntry(
+                    rollbackFilePath = obj.getString("rollbackFilePath"),
+                    insertedMediaUri = obj.getString("insertedMediaUri"),
+                    originalDisplayName = obj.getString("originalDisplayName"),
+                    originalRelativePath = obj.getString("originalRelativePath")
+                )
+                // Only keep entries whose backup file is actually still there (e.g. survived a
+                // prior stale-file sweep) - a stale entry pointing at a deleted file can't be undone.
+                if (File(entry.rollbackFilePath).exists()) {
+                    list.add(entry)
+                }
+            }
+            list
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
     private fun saveTargetSizePresets(list: List<compressedge.joshattic.us.model.TargetSizePreset>) {
         val array = JSONArray()
         for (preset in list) {
@@ -1370,8 +1424,12 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     fun undoReplaceOriginal(context: Context) {
         val rollback = _uiState.value.pendingReplaceRollback
         if (rollback.isEmpty()) return
-        _uiState.update { it.copy(pendingReplaceRollback = emptyList()) }
+        updateReplaceRollback(emptyList())
         viewModelScope.launch(Dispatchers.IO) {
+            // An entry whose restore fails stays in stillPending (re-surfacing the Undo option) rather
+            // than being silently dropped — and, same as replaceOriginals, the backup file is only
+            // deleted once the restore actually landed, so a failed restore never loses the last copy.
+            val stillPending = mutableListOf<ReplaceRollbackEntry>()
             for (entry in rollback) {
                 try {
                     context.contentResolver.delete(Uri.parse(entry.insertedMediaUri), null, null)
@@ -1380,9 +1438,21 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 val backupFile = File(entry.rollbackFilePath)
                 if (backupFile.exists()) {
-                    insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath)
-                    backupFile.delete()
+                    val restored = try {
+                        insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath) != null
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        false
+                    }
+                    if (restored) {
+                        backupFile.delete()
+                    } else {
+                        stillPending.add(entry)
+                    }
                 }
+            }
+            if (stillPending.isNotEmpty()) {
+                updateReplaceRollback(stillPending)
             }
         }
     }
@@ -1401,7 +1471,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val previousRollback = _uiState.value.pendingReplaceRollback
         if (previousRollback.isNotEmpty()) {
             previousRollback.forEach { File(it.rollbackFilePath).delete() }
-            _uiState.update { it.copy(pendingReplaceRollback = emptyList()) }
+            updateReplaceRollback(emptyList())
         }
 
         _uiState.update { it.copy(isSaving = true) }
@@ -1501,18 +1571,26 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                             } else {
                                 // Delete succeeded but insert failed (e.g. storage full): restore the
                                 // original immediately from backup rather than leaving neither file.
-                                insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath)
-                                backupFile.delete()
+                                // Only delete the backup once the restore actually landed — if storage
+                                // is so full that even the small restore write fails too, keeping the
+                                // backup on disk (until the next stale-file sweep) beats guaranteed
+                                // permanent loss of the only remaining copy.
+                                if (insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath) != null) {
+                                    backupFile.delete()
+                                }
                                 fallbackUris.add(Uri.fromFile(candidate.compressedFile))
                             }
                         } catch (e: Exception) {
                             e.printStackTrace()
-                            try {
-                                insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath)
+                            val restored = try {
+                                insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath) != null
                             } catch (restoreError: Exception) {
                                 restoreError.printStackTrace()
+                                false
                             }
-                            backupFile.delete()
+                            if (restored) {
+                                backupFile.delete()
+                            }
                             fallbackUris.add(Uri.fromFile(candidate.compressedFile))
                         }
                     }
@@ -1539,7 +1617,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 // whose original was already deleted and replacement already inserted before the
                 // exception must keep its undo record.
                 if (newRollback.isNotEmpty()) {
-                    _uiState.update { it.copy(pendingReplaceRollback = newRollback) }
+                    updateReplaceRollback(newRollback)
                 }
                 _uiState.update { it.copy(isSaving = false) }
             }
