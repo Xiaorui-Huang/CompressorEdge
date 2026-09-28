@@ -83,6 +83,7 @@ fun ConfigScreen(
     // can't all fit — reflow the whole portrait screen into one scrolling column.
     val largeFontScale = LocalDensity.current.fontScale >= 1.3f
 
+    @Composable
     fun tabIconFor(title: String): androidx.compose.ui.graphics.vector.ImageVector = when (title) {
         "Queue" -> Icons.Outlined.FormatListBulleted
         stringResource(R.string.tab_presets) -> Icons.Outlined.BookmarkBorder

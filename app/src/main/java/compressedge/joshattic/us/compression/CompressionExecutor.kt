@@ -221,7 +221,7 @@ object CompressionExecutor {
             .setEffects(Effects(audioProcessors, effectsList))
             .setRemoveAudio(!shouldIncludeAudio)
         if (params.outputFps > 0) {
-            editedMediaItemBuilder.setFrameRate(params.outputFps.toFloat())
+            editedMediaItemBuilder.setFrameRate(params.outputFps)
         }
         val editedMediaItem = editedMediaItemBuilder.build()
 
