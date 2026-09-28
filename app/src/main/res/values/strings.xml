@@ -195,6 +195,10 @@
     <string name="output_location_reset_subtitle">Reset save location to Movies/Compressor Edge</string>
     <string name="save_next_to_original_title">Save next to original</string>
     <string name="save_next_to_original_subtitle">When possible, saves alongside the original file instead of the folder above</string>
+    <string name="replace_original_title">Replace original</string>
+    <string name="replace_original_subtitle">Deletes the original after verifying the compressed file plays back correctly. Takes priority over the setting above. You can undo this right after saving.</string>
+    <string name="undo_replace_original">Undo</string>
+    <string name="undo_replace_original_description">Restore the original file and remove the replacement</string>
 
     <string name="filename_builder_title">Filename builder</string>
     <string name="filename_builder_subtitle">Drag and drop chips to rearrange, add and remove.</string>

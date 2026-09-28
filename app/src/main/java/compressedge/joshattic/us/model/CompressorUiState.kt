@@ -11,6 +11,14 @@ sealed class FilenameSegment {
     data class Token(val key: String) : FilenameSegment()
 }
 
+/** One replaced original, kept recoverable until [compressedge.joshattic.us.viewmodel.CompressorViewModel.undoReplaceOriginal] or the next replace overwrites it. */
+data class ReplaceRollbackEntry(
+    /** Internal-storage copy of the original file, made before it was deleted. */
+    val rollbackFilePath: String,
+    /** The MediaStore uri the compressed file was inserted at, in place of the deleted original. */
+    val insertedMediaUri: String
+)
+
 val defaultTargetSizePresets = listOf(
     TargetSizePreset("github", 10f, "GitHub"),
     TargetSizePreset("discord", 20f, "Discord"),
@@ -85,6 +93,18 @@ data class CompressorUiState(
     val customOutputFolderName: String? = null,
     /** When enabled, saving tries to place the output next to its original source file before falling back to the configured location above. */
     val saveNextToOriginal: Boolean = false,
+    /**
+     * When enabled, saving verifies the output (playback, duration, metadata) then deletes the
+     * original and replaces it in place, keeping a rollback copy until undone. Takes priority over
+     * [saveNextToOriginal] when both are on. Anything that fails verification, isn't resolvable, or
+     * is permission-denied falls back to [saveNextToOriginal]/the configured location instead —
+     * this never risks the original.
+     */
+    val replaceOriginal: Boolean = false,
+    /** Rollback copies from the most recent replace-original save, restorable via [compressedge.joshattic.us.viewmodel.CompressorViewModel.undoReplaceOriginal]. */
+    val pendingReplaceRollback: List<ReplaceRollbackEntry> = emptyList(),
+    /** Set when Android needs the user's explicit consent to delete an original (API 29-30); the UI launches this and reports the result back. */
+    val pendingDeleteRequest: android.content.IntentSender? = null,
     val hasShared: Boolean = false,
     val removeAudio: Boolean = false,
     val audioCodec: String = MimeTypes.AUDIO_AAC,

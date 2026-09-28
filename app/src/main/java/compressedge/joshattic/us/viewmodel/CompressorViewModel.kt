@@ -33,6 +33,7 @@ import compressedge.joshattic.us.compression.BackgroundCompressionService
 import compressedge.joshattic.us.compression.CompressionExecutor
 import compressedge.joshattic.us.model.CompressorUiState
 import compressedge.joshattic.us.model.FilenameSegment
+import compressedge.joshattic.us.model.ReplaceRollbackEntry
 import compressedge.joshattic.us.model.DefaultAudioConfig
 import compressedge.joshattic.us.model.DefaultVideoConfig
 import compressedge.joshattic.us.model.QualityPreset
@@ -40,6 +41,7 @@ import compressedge.joshattic.us.model.QualityPresetConfig
 import compressedge.joshattic.us.model.TargetSizePreset
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -95,6 +97,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         private const val PREF_CUSTOM_OUTPUT_TREE_URI = "custom_output_tree_uri"
         private const val PREF_CUSTOM_OUTPUT_FOLDER_NAME = "custom_output_folder_name"
         private const val PREF_SAVE_NEXT_TO_ORIGINAL = "save_next_to_original"
+        private const val PREF_REPLACE_ORIGINAL = "replace_original"
+        private const val REPLACE_ROLLBACK_MAX_AGE_MS = 3L * 24 * 60 * 60 * 1000
         private const val PREF_SAVED_VERSION_CODE = "saved_app_version_code"
         private const val PREF_FILENAME_SEGMENTS = "filename_segments_v2"
         private const val DEFAULT_FILENAME_SEGMENTS = "token:original_name|token:compressed"
@@ -114,6 +118,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val customOutputTreeUri = prefs.getString(PREF_CUSTOM_OUTPUT_TREE_URI, null)
         val customOutputFolderName = prefs.getString(PREF_CUSTOM_OUTPUT_FOLDER_NAME, null)
         val saveNextToOriginal = prefs.getBoolean(PREF_SAVE_NEXT_TO_ORIGINAL, false)
+        val replaceOriginal = prefs.getBoolean(PREF_REPLACE_ORIGINAL, false)
         val highConfig = loadQualityPresetConfig("preset_high", QualityPresetConfig(resolutionShortSide = 0, targetFps = 0, sizeRatio = 0.7f, audioBitrate = 320_000))
         val mediumConfig = loadQualityPresetConfig("preset_medium", QualityPresetConfig(resolutionShortSide = 1080, targetFps = 30, sizeRatio = 0.4f, audioBitrate = 192_000))
         val lowConfig = loadQualityPresetConfig("preset_low", QualityPresetConfig(resolutionShortSide = 720, targetFps = 30, sizeRatio = 0.2f, audioBitrate = 128_000))
@@ -149,6 +154,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             customOutputTreeUri = customOutputTreeUri,
             customOutputFolderName = customOutputFolderName,
             saveNextToOriginal = saveNextToOriginal,
+            replaceOriginal = replaceOriginal,
             highPresetConfig = highConfig,
             mediumPresetConfig = mediumConfig,
             lowPresetConfig = lowConfig,
@@ -1239,6 +1245,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update { it.copy(saveNextToOriginal = enabled) }
     }
 
+    fun setReplaceOriginal(enabled: Boolean) {
+        prefs.edit { putBoolean(PREF_REPLACE_ORIGINAL, enabled) }
+        _uiState.update { it.copy(replaceOriginal = enabled) }
+    }
+
     private fun releasePersistedTreeUri(context: Context, uriString: String?) {
         if (uriString.isNullOrBlank()) return
         try {
@@ -1278,6 +1289,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val items = compressedItemsWithOriginals(currentState)
         if (items.isEmpty()) return
 
+        if (currentState.replaceOriginal) {
+            replaceOriginals(context, items)
+            return
+        }
+
         if (!currentState.saveNextToOriginal) {
             val treeUri = currentState.customOutputTreeUri
             if (!treeUri.isNullOrBlank()) {
@@ -1298,7 +1314,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     if (file == null || !file.exists()) continue
 
                     val relativePath = originalRelativePath(context, originalUri)
-                    if (relativePath != null && insertVideoIntoMediaStore(context, file, file.name, relativePath)) {
+                    if (relativePath != null && insertVideoIntoMediaStore(context, file, file.name, relativePath) != null) {
                         savedNextToOriginal++
                     } else {
                         fallbackUris.add(uri)
@@ -1330,6 +1346,296 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    private var pendingDeleteConsent: CompletableDeferred<Boolean>? = null
+
+    /** Called by the UI after launching [CompressorUiState.pendingDeleteRequest] and getting a result back. */
+    fun onDeleteRequestResult(granted: Boolean) {
+        _uiState.update { it.copy(pendingDeleteRequest = null) }
+        pendingDeleteConsent?.complete(granted)
+        pendingDeleteConsent = null
+    }
+
+    /** Restores the most recent replace-original save: deletes the replacement and re-inserts the backed-up original. */
+    fun undoReplaceOriginal(context: Context) {
+        val rollback = _uiState.value.pendingReplaceRollback
+        if (rollback.isEmpty()) return
+        _uiState.update { it.copy(pendingReplaceRollback = emptyList()) }
+        viewModelScope.launch(Dispatchers.IO) {
+            for (entry in rollback) {
+                try {
+                    context.contentResolver.delete(Uri.parse(entry.insertedMediaUri), null, null)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                val backupFile = File(entry.rollbackFilePath)
+                if (backupFile.exists()) {
+                    insertVideoIntoMediaStore(context, backupFile, entry.originalDisplayName, entry.originalRelativePath)
+                    backupFile.delete()
+                }
+            }
+        }
+    }
+
+    /**
+     * Verifies each candidate (playback + duration sanity + the metadata check from
+     * [CompressionExecutor.checkMetadataPreservation]), backs up whatever passes, deletes the
+     * original (batched consent on API 30+, a single consent dialog on API 29, a plain attempt with
+     * no dialog on API 26-28), then inserts the compressed file in its place. Anything that fails
+     * verification, backup, or delete consent is never touched and falls back to the plain default
+     * save location instead — this never risks losing the original.
+     */
+    private fun replaceOriginals(context: Context, items: List<Pair<Uri, Uri?>>) {
+        data class Candidate(val compressedFile: File, val originalUri: Uri, val relativePath: String, val displayName: String)
+
+        val previousRollback = _uiState.value.pendingReplaceRollback
+        if (previousRollback.isNotEmpty()) {
+            previousRollback.forEach { File(it.rollbackFilePath).delete() }
+            _uiState.update { it.copy(pendingReplaceRollback = emptyList()) }
+        }
+
+        _uiState.update { it.copy(isSaving = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val candidates = mutableListOf<Candidate>()
+                val fallbackUris = mutableListOf<Uri>()
+
+                for ((uri, originalUri) in items) {
+                    val file = uri.path?.let { File(it) }
+                    if (file == null || !file.exists()) continue
+
+                    val relativePath = originalUri?.let { originalRelativePath(context, it) }
+                    val displayName = originalUri?.let { queryDisplayName(context, it) }
+                    val verified = originalUri != null && relativePath != null && displayName != null &&
+                        verifyReplaceCandidate(context, originalUri, file)
+
+                    if (verified) {
+                        candidates.add(Candidate(file, originalUri!!, relativePath!!, displayName!!))
+                    } else {
+                        fallbackUris.add(uri)
+                    }
+                }
+
+                val rollbackDir = File(context.filesDir, "replace_rollback").apply { mkdirs() }
+                purgeStaleRollbackFiles(rollbackDir)
+
+                val backedUp = mutableListOf<Pair<Candidate, File>>()
+                for (candidate in candidates) {
+                    val backupFile = File(rollbackDir, "${System.currentTimeMillis()}_${candidate.displayName}")
+                    val ok = try {
+                        context.contentResolver.openInputStream(candidate.originalUri)?.use { input ->
+                            backupFile.outputStream().use { out -> input.copyTo(out, COPY_BUFFER_BYTES) }
+                        }
+                        backupFile.exists() && backupFile.length() > 0
+                    } catch (e: Exception) {
+                        false
+                    }
+                    if (ok) {
+                        backedUp.add(candidate to backupFile)
+                    } else {
+                        backupFile.delete()
+                        fallbackUris.add(Uri.fromFile(candidate.compressedFile))
+                    }
+                }
+
+                val newRollback = mutableListOf<ReplaceRollbackEntry>()
+
+                if (backedUp.isNotEmpty()) {
+                    val deletedOk: Map<Candidate, Boolean> = when {
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                            val ok = deleteOriginalsBatch(context, backedUp.map { it.first.originalUri })
+                            backedUp.associate { it.first to ok }
+                        }
+                        backedUp.size == 1 -> {
+                            backedUp.associate { it.first to deleteOriginalWithConsent(context, it.first.originalUri) }
+                        }
+                        else -> {
+                            // No clean multi-item consent flow below API 30: attempt a plain delete
+                            // per item with no dialog, rather than chaining several consent prompts.
+                            backedUp.associate { (candidate, _) ->
+                                candidate to try {
+                                    context.contentResolver.delete(candidate.originalUri, null, null)
+                                    !uriStillExists(context, candidate.originalUri)
+                                } catch (e: Exception) {
+                                    false
+                                }
+                            }
+                        }
+                    }
+
+                    for ((candidate, backupFile) in backedUp) {
+                        if (deletedOk[candidate] != true) {
+                            backupFile.delete()
+                            fallbackUris.add(Uri.fromFile(candidate.compressedFile))
+                            continue
+                        }
+                        val insertedUri = insertVideoIntoMediaStore(context, candidate.compressedFile, candidate.displayName, candidate.relativePath)
+                        if (insertedUri != null) {
+                            newRollback.add(
+                                ReplaceRollbackEntry(
+                                    rollbackFilePath = backupFile.absolutePath,
+                                    insertedMediaUri = insertedUri.toString(),
+                                    originalDisplayName = candidate.displayName,
+                                    originalRelativePath = candidate.relativePath
+                                )
+                            )
+                        } else {
+                            // Delete succeeded but insert failed (e.g. storage full): restore the
+                            // original immediately from backup rather than leaving neither file.
+                            insertVideoIntoMediaStore(context, backupFile, candidate.displayName, candidate.relativePath)
+                            backupFile.delete()
+                            fallbackUris.add(Uri.fromFile(candidate.compressedFile))
+                        }
+                    }
+                }
+
+                if (fallbackUris.isNotEmpty()) {
+                    val currentState = _uiState.value
+                    val treeUri = currentState.customOutputTreeUri
+                    if (!treeUri.isNullOrBlank()) {
+                        saveUrisToCustomTreeBlocking(context, Uri.parse(treeUri), fallbackUris)
+                    } else {
+                        saveUrisToGalleryBlocking(context, fallbackUris)
+                    }
+                }
+
+                _uiState.update { it.copy(saveSuccess = true, pendingReplaceRollback = newRollback) }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _uiState.update {
+                    it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message))
+                }
+            } finally {
+                _uiState.update { it.copy(isSaving = false) }
+            }
+        }
+    }
+
+    /** Playback + duration sanity check, plus the metadata-preservation check from [CompressionExecutor]. */
+    private fun verifyReplaceCandidate(context: Context, originalUri: Uri, compressedFile: File): Boolean {
+        return try {
+            val extractor = MediaExtractor()
+            var trackCount = 0
+            var durationUs = 0L
+            try {
+                extractor.setDataSource(compressedFile.absolutePath)
+                trackCount = extractor.trackCount
+                for (i in 0 until trackCount) {
+                    val format = extractor.getTrackFormat(i)
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        durationUs = maxOf(durationUs, format.getLong(MediaFormat.KEY_DURATION))
+                    }
+                }
+            } finally {
+                extractor.release()
+            }
+            if (trackCount == 0) return false
+
+            val originalDurationMs = queryOriginalDurationMs(context, originalUri)
+            if (originalDurationMs > 0 && durationUs > 0) {
+                val compressedDurationMs = durationUs / 1000
+                val diff = kotlin.math.abs(compressedDurationMs - originalDurationMs)
+                val tolerance = maxOf(1000L, originalDurationMs / 20)
+                if (diff > tolerance) return false
+            }
+
+            val metadataResult = CompressionExecutor.checkMetadataPreservation(context, originalUri, compressedFile.absolutePath)
+            if (metadataResult.timestampPreserved == false || metadataResult.locationPreserved == false) return false
+
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun queryOriginalDurationMs(context: Context, uri: Uri): Long {
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            0L
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun queryDisplayName(context: Context, uri: Uri): String? {
+        return try {
+            context.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+                null, null, null
+            )?.use { cursor ->
+                val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx) else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun uriStillExists(context: Context, uri: Uri): Boolean {
+        return try {
+            context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)?.use { it.moveToFirst() } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun purgeStaleRollbackFiles(dir: File) {
+        try {
+            val cutoff = System.currentTimeMillis() - REPLACE_ROLLBACK_MAX_AGE_MS
+            dir.listFiles()?.forEach { f ->
+                if (f.lastModified() < cutoff) f.delete()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /** API 30+: one system dialog covering every uri at once. */
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
+    private suspend fun deleteOriginalsBatch(context: Context, uris: List<Uri>): Boolean {
+        return try {
+            val pendingIntent = MediaStore.createDeleteRequest(context.contentResolver, uris)
+            awaitDeleteConsent(pendingIntent.intentSender)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    /** Exactly API 29: a direct delete throws [android.app.RecoverableSecurityException] with a one-time consent intent. */
+    private suspend fun deleteOriginalWithConsent(context: Context, uri: Uri): Boolean {
+        return try {
+            context.contentResolver.delete(uri, null, null)
+            !uriStillExists(context, uri)
+        } catch (e: SecurityException) {
+            val recoverable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                e as? android.app.RecoverableSecurityException
+            } else {
+                null
+            }
+            if (recoverable != null) {
+                val granted = awaitDeleteConsent(recoverable.userAction.actionIntent.intentSender)
+                granted && !uriStillExists(context, uri)
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private suspend fun awaitDeleteConsent(intentSender: android.content.IntentSender): Boolean {
+        val deferred = CompletableDeferred<Boolean>()
+        pendingDeleteConsent = deferred
+        _uiState.update { it.copy(pendingDeleteRequest = intentSender) }
+        return deferred.await()
+    }
+
     /** Pairs each pending compressed output with the source uri it was produced from, when known. */
     private fun compressedItemsWithOriginals(state: CompressorUiState): List<Pair<Uri, Uri?>> {
         val targetUris = if (state.compressedUris.isNotEmpty()) state.compressedUris else listOfNotNull(state.compressedUri)
@@ -1353,7 +1659,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private fun insertVideoIntoMediaStore(context: Context, file: File, displayName: String, relativePath: String): Boolean {
+    /** Returns the inserted item's uri on success, or null on failure (nothing left behind either way). */
+    private fun insertVideoIntoMediaStore(context: Context, file: File, displayName: String, relativePath: String): Uri? {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -1370,7 +1677,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         }
 
-        val itemUri = context.contentResolver.insert(collection, values) ?: return false
+        val itemUri = context.contentResolver.insert(collection, values) ?: return null
         return try {
             val copied = context.contentResolver.openOutputStream(itemUri)?.use { out ->
                 file.inputStream().use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
@@ -1379,7 +1686,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
             if (!copied) {
                 context.contentResolver.delete(itemUri, null, null)
-                return false
+                return null
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -1387,11 +1694,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 values.put(MediaStore.Video.Media.IS_PENDING, 0)
                 context.contentResolver.update(itemUri, values, null, null)
             }
-            true
+            itemUri
         } catch (e: Exception) {
             e.printStackTrace()
             context.contentResolver.delete(itemUri, null, null)
-            false
+            null
         }
     }
 
@@ -1401,7 +1708,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         for (uri in uris) {
             val file = uri.path?.let { File(it) } ?: continue
             if (!file.exists()) continue
-            if (insertVideoIntoMediaStore(context, file, file.name, Environment.DIRECTORY_MOVIES + "/Compressor Edge")) {
+            if (insertVideoIntoMediaStore(context, file, file.name, Environment.DIRECTORY_MOVIES + "/Compressor Edge") != null) {
                 savedCount++
             }
         }

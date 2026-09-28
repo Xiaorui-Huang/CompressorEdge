@@ -70,7 +70,15 @@ nobody else bases work on, but confirm that's still true before forcing.
 
 To add a new feature: branch it off the current `sync/compressor-upstream`
 tip (not off `personal/edge`), then merge it into `personal/edge` once it's
-ready.
+ready. **Exception**: if the feature genuinely depends on another feature
+already merged into `personal/edge` (reuses its helpers, extends its state)
+rather than being independent, branch off `personal/edge` instead — that's
+what `feature/replace-original` did, since it reuses
+`feature/save-next-to-original`'s MediaStore-relative-path helpers and
+`feature/metadata-preservation`'s verification check. Don't force
+independence where there isn't any; just branch from wherever the
+dependency is actually satisfied, and note the dependency in the feature's
+own commit message.
 
 ## Repo structure quick reference
 
