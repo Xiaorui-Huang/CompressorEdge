@@ -1915,6 +1915,12 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /** Blocking (must run on an IO dispatcher) helper shared by [saveToCustomTree] and the next-to-original fallback path. */
+    /**
+     * Returns whether at least one file was actually written, not just whether the tree itself was
+     * writable - a target folder that's writable but where every individual file write fails (name
+     * collision the provider won't resolve, per-file quota, a mid-copy exception) must not be
+     * reported as success to callers deciding whether to fall back or show an error.
+     */
     private fun saveUrisToCustomTreeBlocking(context: Context, treeUri: Uri, uris: List<Uri>): Boolean {
         val tree = DocumentFile.fromTreeUri(context, treeUri)
         if (tree == null || !tree.canWrite()) {
@@ -1924,6 +1930,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             return false
         }
 
+        var savedCount = 0
         for (uri in uris) {
             val file = uri.path?.let { File(it) } ?: continue
             if (!file.exists()) continue
@@ -1932,11 +1939,17 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             tree.findFile(targetName)?.takeIf { it.isFile }?.delete()
             val target = tree.createFile("video/mp4", targetName) ?: continue
 
-            context.contentResolver.openOutputStream(target.uri)?.use { out ->
-                file.inputStream().use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
+            val wrote = try {
+                context.contentResolver.openOutputStream(target.uri)?.use { out ->
+                    file.inputStream().use { input -> input.copyTo(out, COPY_BUFFER_BYTES) }
+                } != null
+            } catch (e: Exception) {
+                e.printStackTrace()
+                false
             }
+            if (wrote) savedCount++
         }
-        return true
+        return savedCount > 0
     }
 
     fun toggleRemoveAudio() {
