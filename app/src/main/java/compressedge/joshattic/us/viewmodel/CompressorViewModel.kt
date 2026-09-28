@@ -1956,9 +1956,15 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         return savedCount
     }
 
-    /** Appends a dedup'd warning when only some of a batch's files were actually saved. */
+    /**
+     * Appends a dedup'd warning when fewer than [totalCount] files were actually saved - including
+     * savedCount == 0 (the fallback sub-batch failed completely while an earlier part of the same
+     * save succeeded elsewhere, e.g. via the primary next-to-original/replace path): that case must
+     * still warn, since callers only treat savedCount == 0 as fatal when nothing else succeeded
+     * either, and otherwise silently fall through to saveSuccess = true.
+     */
     private fun addPartialSaveWarning(savedCount: Int, totalCount: Int) {
-        if (savedCount <= 0 || savedCount >= totalCount) return
+        if (savedCount >= totalCount) return
         val msg = getApplication<Application>().getString(
             R.string.warning_partial_save_failure, totalCount - savedCount, totalCount
         )
