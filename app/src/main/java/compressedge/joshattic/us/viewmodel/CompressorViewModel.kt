@@ -2075,6 +2075,9 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 backgroundCompressionPrompted = current.backgroundCompressionPrompted,
                 customOutputTreeUri = current.customOutputTreeUri,
                 customOutputFolderName = current.customOutputFolderName,
+                saveNextToOriginal = current.saveNextToOriginal,
+                replaceOriginal = current.replaceOriginal,
+                pendingReplaceRollback = current.pendingReplaceRollback,
                 allCodecsEnabled = current.allCodecsEnabled,
                 allCodecsUnlocked = current.allCodecsUnlocked,
                 highPresetConfig = current.highPresetConfig,
@@ -2847,6 +2850,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message)) }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
+                maybeRetrySave(context)
             }
         }
     }
@@ -2867,6 +2871,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
+                maybeRetrySave(context)
             }
         }
     }
@@ -2892,6 +2897,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_save_failed, e.message)) }
             } finally {
                 _uiState.update { it.copy(isSaving = false) }
+                maybeRetrySave(context)
             }
         }
     }
