@@ -20,7 +20,7 @@ jobs:
       - name: Install NDK and build tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build nasm xxd pkg-config qemu-user-static
+          sudo apt-get install -y meson ninja-build nasm xxd pkg-config
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install requested NDK version via sdkmanager
@@ -49,7 +49,6 @@ jobs:
           ar = '$TOOLCHAIN/bin/llvm-ar'
           strip = '$TOOLCHAIN/bin/llvm-strip'
           pkg-config = 'pkg-config'
-          exe_wrapper = '/usr/bin/qemu-aarch64-static'
 
           [host_machine]
           system = 'android'
@@ -58,6 +57,14 @@ jobs:
           endian = 'little'
 
           [properties]
+          # Deliberately no exe_wrapper: qemu-aarch64-static can't run these binaries anyway
+          # (they're bionic-linked against the NDK's Android libc, not runnable by plain
+          # user-mode qemu without the device's actual system libraries) - tried it, meson's
+          # own compiler sanity check then fails outright with "Executables ... are not
+          # runnable." Leaving exe_wrapper unset makes meson skip execution-dependent checks
+          # instead, which is what this measurement-only build needs; any meson.build change
+          # that later added a real cc.run()-based check would fail loudly and clearly at
+          # configure time (not silently), so this is a safe, working tradeoff for a spike.
           needs_exe_wrapper = true
           EOF
           cat android-arm64.meson.cross
