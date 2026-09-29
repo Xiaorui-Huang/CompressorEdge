@@ -2,7 +2,8 @@ name: VMAF spike - single-ABI libvmaf size/build check
 
 # Throwaway measurement workflow for the A1 TODO item (see TODO.md "A1 - VMAF").
 # Does NOT touch the app - it cross-compiles libvmaf for arm64-v8a only, outside the
-# Gradle/AGP build, purely to get a real .so + model-asset size number and confirm the
+# Gradle/AGP build, purely to get a real .so size number (the built-in models are compiled
+# directly into that .so, not shipped as a separate asset - see TODO.md) and confirm the
 # cross-build actually works before any app-side integration is attempted. Delete this
 # workflow (and the feature/vmaf-spike branch) once A1's go/no-go decision is made.
 
@@ -19,18 +20,21 @@ jobs:
       - name: Install NDK and build tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build nasm xxd pkg-config
+          sudo apt-get install -y meson ninja-build nasm xxd pkg-config qemu-user-static
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install requested NDK version via sdkmanager
         run: |
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
 
-      - name: Checkout vmaf source (pinned tag)
+      # Pinned by commit SHA (the commit tag v3.0.0 pointed to as of 2026-09-28) rather
+      # than the mutable tag itself, so this build stays reproducible even if the tag
+      # is ever force-moved upstream.
+      - name: Checkout vmaf source (pinned commit)
         uses: actions/checkout@v4
         with:
           repository: Netflix/vmaf
-          ref: v3.0.0
+          ref: 17a67b238ce0539bdeafdc95961abac64fa16ea8
           path: vmaf-src
 
       - name: Write Android arm64 meson cross file
@@ -44,7 +48,8 @@ jobs:
           cpp = '$TOOLCHAIN/bin/aarch64-linux-android${API}-clang++'
           ar = '$TOOLCHAIN/bin/llvm-ar'
           strip = '$TOOLCHAIN/bin/llvm-strip'
-          pkgconfig = 'pkg-config'
+          pkg-config = 'pkg-config'
+          exe_wrapper = '/usr/bin/qemu-aarch64-static'
 
           [host_machine]
           system = 'android'
@@ -57,10 +62,10 @@ jobs:
           EOF
           cat android-arm64.meson.cross
 
-      - name: Configure libvmaf (arm64-v8a only, no CLI tools, static model bundled)
+      - name: Configure + build libvmaf (release, -O3 - matches a typical production build)
         working-directory: vmaf-src/libvmaf
         run: |
-          meson setup build \
+          meson setup build-release \
             --cross-file ../../android-arm64.meson.cross \
             --default-library shared \
             -Denable_cuda=false \
@@ -69,26 +74,42 @@ jobs:
             -Denable_tests=false \
             -Denable_docs=false \
             -Dbuildtype=release
+          ninja -C build-release
 
-      - name: Build libvmaf
-        working-directory: vmaf-src/libvmaf
-        run: ninja -C build
-
-      - name: Report sizes
+      # -Os is the number that actually matters for the fork's size budget; release and
+      # minsize sizes are reported side by side below rather than picking one as "the" answer.
+      - name: Configure + build libvmaf (minsize, -Os)
         working-directory: vmaf-src/libvmaf
         run: |
-          echo "== libvmaf.so (unstripped) =="
-          find build -name "libvmaf.so*" -exec ls -lh {} \;
-          echo "== stripped size =="
-          SO=$(find build -name "libvmaf.so" | head -1)
-          cp "$SO" /tmp/libvmaf.so
-          "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip /tmp/libvmaf.so
-          ls -lh /tmp/libvmaf.so
-          echo "== bundled built-in model size (source, before any stripping) =="
-          find ../model -name "*.json" -o -name "*.pkl" | xargs ls -lh 2>/dev/null || true
+          meson setup build-minsize \
+            --cross-file ../../android-arm64.meson.cross \
+            --default-library shared \
+            -Denable_cuda=false \
+            -Dbuilt_in_models=true \
+            -Denable_avx512=false \
+            -Denable_tests=false \
+            -Denable_docs=false \
+            -Dbuildtype=minsize
+          ninja -C build-minsize
 
-      - name: Upload stripped .so as artifact
+      - name: Report sizes (release vs minsize, unstripped vs stripped)
+        working-directory: vmaf-src/libvmaf
+        run: |
+          STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          for variant in release minsize; do
+            SO="build-$variant/src/libvmaf.so"
+            echo "== $variant: unstripped =="
+            ls -lh "$SO"
+            cp "$SO" "/tmp/libvmaf-$variant.so"
+            "$STRIP" "/tmp/libvmaf-$variant.so"
+            echo "== $variant: stripped =="
+            ls -lh "/tmp/libvmaf-$variant.so"
+          done
+          echo "== on-disk size of the 5 JSON models compiled into the .so (built_in_models=true) - reference only, not a separate shipped asset =="
+          ls -lh ../model/vmaf_v0.6.1.json ../model/vmaf_v0.6.1neg.json ../model/vmaf_4k_v0.6.1.json ../model/vmaf_4k_v0.6.1neg.json ../model/vmaf_b_v0.6.3.json
+
+      - name: Upload stripped .so variants as artifacts
         uses: actions/upload-artifact@v4
         with:
           name: libvmaf-arm64-v8a
-          path: /tmp/libvmaf.so
+          path: /tmp/libvmaf-*.so
